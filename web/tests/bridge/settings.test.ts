@@ -29,6 +29,7 @@ import {
   getMicrophoneStatus,
   getModelRegistry,
   getStats,
+  loadBuiltinHotwords,
   loadHotwords,
   loadPrompts,
   onEvent,
@@ -152,8 +153,14 @@ describe("settings bridge — data methods", () => {
   });
 
   it("saveHotwords invokes save_hotwords", async () => {
-    await saveHotwords({ active_group: "g1" });
-    expect(invoke).toHaveBeenCalledWith("save_hotwords", { data: { active_group: "g1" } });
+    const data = { active_group: "g1", groups: [] };
+    await saveHotwords(data);
+    expect(invoke).toHaveBeenCalledWith("save_hotwords", { data });
+  });
+
+  it("loadBuiltinHotwords invokes load_builtin_hotwords", async () => {
+    await loadBuiltinHotwords();
+    expect(invoke).toHaveBeenCalledWith("load_builtin_hotwords");
   });
 });
 

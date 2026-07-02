@@ -631,6 +631,13 @@ pub async fn save_hotwords(
     Ok(serde_json::json!({ "ok": true }))
 }
 
+/// Load built-in hotword tables from the bundled app resource (read-only).
+/// Used by the "常用热词表" picker; never touches user data.
+#[tauri::command]
+pub async fn load_builtin_hotwords(state: State<'_, AppState>) -> Result<HotwordData, String> {
+    Ok(state.hotword_manager.load_builtin())
+}
+
 // ---------------------------------------------------------------------------
 // Model management commands
 // ---------------------------------------------------------------------------

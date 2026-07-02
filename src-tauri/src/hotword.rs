@@ -23,18 +23,18 @@ pub struct HotwordGroup {
 }
 
 fn default_active_group() -> String {
-    "default".to_string()
+    String::new()
 }
 
 impl Default for HotwordData {
     fn default() -> Self {
+        // New users start with an empty custom library. Built-in tables are
+        // surfaced on demand via `load_builtin` (the "常用热词表" picker) and
+        // are never seeded into user data — so deletions persist across
+        // restarts and app updates never overwrite the user's library.
         Self {
             active_group: default_active_group(),
-            groups: vec![HotwordGroup {
-                id: "default".to_string(),
-                name: "默认热词表".to_string(),
-                words: Vec::new(),
-            }],
+            groups: Vec::new(),
         }
     }
 }
@@ -43,37 +43,33 @@ impl Default for HotwordData {
 /// Pattern mirrors `ConfigManager` — in-memory cache, read-through on load.
 pub struct HotwordManager {
     path: PathBuf,
+    /// Path to the bundled built-in `hotwords.json` (read-only app resource).
+    builtin_path: PathBuf,
     cached: RwLock<HotwordData>,
 }
 
 impl HotwordManager {
     pub fn new(data_dir: &Path, resource_dir: &Path) -> Self {
         let path = data_dir.join("hotwords.json");
-        let example_path = resource_dir.join("hotwords.json");
+        let builtin_path = resource_dir.join("hotwords.json");
 
-        // Ensure file exists
+        // First run: seed an empty custom library. Built-in tables are NOT
+        // copied into user data — they are read on demand via `load_builtin`.
+        // Existing users (file already present) keep their data verbatim,
+        // including any previously-merged built-in tables, which now behave as
+        // ordinary editable custom tables. Startup never merges defaults back
+        // in, so user deletions persist across restarts.
         if !path.exists() {
-            if example_path.exists() {
-                let _ = fs::copy(&example_path, &path);
-            } else {
-                let default = HotwordData::default();
-                if let Ok(json) = serde_json::to_string_pretty(&default) {
-                    let _ = fs::write(&path, json);
-                }
+            let default = HotwordData::default();
+            if let Ok(json) = serde_json::to_string_pretty(&default) {
+                let _ = fs::write(&path, json);
             }
         }
 
-        let mut data = Self::read_from_disk(&path);
-        if let Some(defaults) = Self::read_example(&example_path) {
-            let changed = Self::merge_defaults(&mut data, defaults);
-            if changed {
-                if let Ok(json) = serde_json::to_string_pretty(&data) {
-                    let _ = fs::write(&path, json);
-                }
-            }
-        }
+        let data = Self::read_from_disk(&path);
         Self {
             path,
+            builtin_path,
             cached: RwLock::new(data),
         }
     }
@@ -91,29 +87,12 @@ impl HotwordManager {
         serde_json::from_str(&content).ok()
     }
 
-    fn merge_defaults(data: &mut HotwordData, defaults: HotwordData) -> bool {
-        let mut changed = false;
-
-        for default_group in defaults.groups {
-            if let Some(group) = data.groups.iter_mut().find(|g| g.id == default_group.id) {
-                for word in default_group.words {
-                    if !group.words.contains(&word) {
-                        group.words.push(word);
-                        changed = true;
-                    }
-                }
-            } else {
-                data.groups.push(default_group);
-                changed = true;
-            }
-        }
-
-        if data.groups.iter().all(|g| g.id != data.active_group) {
-            data.active_group = default_active_group();
-            changed = true;
-        }
-
-        changed
+    /// Load the built-in hotword tables from the bundled app resource
+    /// (`hotwords.json` in the resource dir). Read-only: never touches user
+    /// data. Used by the "常用热词表" picker so app updates refresh the built-in
+    /// library without affecting existing users' custom libraries.
+    pub fn load_builtin(&self) -> HotwordData {
+        Self::read_example(&self.builtin_path).unwrap_or_default()
     }
 
     /// Load hotword data from memory cache (no disk I/O).
@@ -154,6 +133,16 @@ impl HotwordManager {
         }
 
         let mut data = self.load();
+        // Upsert the "default" group: new users start with an empty library,
+        // so the group may not exist yet. Create it (preserving the legacy
+        // "merge into the default group" intent) before merging the words.
+        if !data.groups.iter().any(|g| g.id == "default") {
+            data.groups.push(HotwordGroup {
+                id: "default".to_string(),
+                name: "默认热词表".to_string(),
+                words: Vec::new(),
+            });
+        }
         if let Some(default_group) = data.groups.iter_mut().find(|g| g.id == "default") {
             for word in &words {
                 if !default_group.words.contains(word) {
@@ -407,20 +396,87 @@ mod tests {
     }
 
     #[test]
-    fn merge_defaults_adds_missing_words_without_duplicates() {
-        let mut data = HotwordData::default();
-        let defaults = HotwordData {
-            active_group: "default".to_string(),
+    fn new_creates_empty_library_for_new_user() {
+        let data_dir = tempfile::tempdir().unwrap();
+        let resource_dir = tempfile::tempdir().unwrap();
+        // Bundled built-in tables exist in the resource dir.
+        let builtin = HotwordData {
+            active_group: String::new(),
             groups: vec![HotwordGroup {
                 id: "default".to_string(),
                 name: "默认热词表".to_string(),
-                words: vec!["Claude".to_string(), "OpenAI".to_string()],
+                words: vec!["Claude".to_string()],
             }],
         };
+        std::fs::write(
+            resource_dir.path().join("hotwords.json"),
+            serde_json::to_string_pretty(&builtin).unwrap(),
+        )
+        .unwrap();
 
-        assert!(HotwordManager::merge_defaults(&mut data, defaults.clone()));
-        assert_eq!(data.groups[0].words, vec!["Claude", "OpenAI"]);
-        assert!(!HotwordManager::merge_defaults(&mut data, defaults));
+        let manager = HotwordManager::new(data_dir.path(), resource_dir.path());
+
+        // User data file is created, but the library is empty — built-ins are
+        // NOT seeded into user data, so user deletions can never be overwritten.
+        let loaded = manager.load();
+        assert!(loaded.groups.is_empty());
+        assert_eq!(loaded.active_group, "");
+    }
+
+    #[test]
+    fn load_builtin_reads_resource_file_without_touching_user_data() {
+        let data_dir = tempfile::tempdir().unwrap();
+        let resource_dir = tempfile::tempdir().unwrap();
+        let builtin = HotwordData {
+            active_group: "default".to_string(),
+            groups: vec![
+                HotwordGroup {
+                    id: "default".to_string(),
+                    name: "默认热词表".to_string(),
+                    words: vec!["Claude".to_string()],
+                },
+                HotwordGroup {
+                    id: "ecommerce".to_string(),
+                    name: "电商热词表".to_string(),
+                    words: vec!["SKU".to_string()],
+                },
+            ],
+        };
+        std::fs::write(
+            resource_dir.path().join("hotwords.json"),
+            serde_json::to_string_pretty(&builtin).unwrap(),
+        )
+        .unwrap();
+
+        let manager = HotwordManager::new(data_dir.path(), resource_dir.path());
+
+        // Built-in tables are read from the resource on demand.
+        let builtin_loaded = manager.load_builtin();
+        assert_eq!(builtin_loaded.groups.len(), 2);
+        assert_eq!(builtin_loaded.groups[0].id, "default");
+        assert_eq!(builtin_loaded.groups[1].id, "ecommerce");
+
+        // User data stays empty — load_builtin never writes to it.
+        assert!(manager.load().groups.is_empty());
+    }
+
+    #[test]
+    fn import_from_legacy_creates_default_group_when_absent() {
+        let data_dir = tempfile::tempdir().unwrap();
+        let resource_dir = tempfile::tempdir().unwrap();
+        // No built-in resource; user starts with an empty library.
+        let manager = HotwordManager::new(data_dir.path(), resource_dir.path());
+        assert!(manager.load().groups.is_empty());
+
+        manager
+            .import_from_legacy("Claude, OpenAI, Claude")
+            .unwrap();
+
+        let loaded = manager.load();
+        assert_eq!(loaded.groups.len(), 1);
+        assert_eq!(loaded.groups[0].id, "default");
+        // De-duplicated, both words present in input order.
+        assert_eq!(loaded.groups[0].words, vec!["Claude", "OpenAI"]);
     }
 
     #[test]

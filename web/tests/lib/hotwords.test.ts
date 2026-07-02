@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
-import { mergeHotwords, parseHotwordInput } from "@/settings/lib/hotwords";
+import { cloneBuiltinGroup, mergeHotwords, parseHotwordInput } from "@/settings/lib/hotwords";
+import type { HotwordGroup } from "@/settings/types/hotwords";
 
 describe("parseHotwordInput", () => {
   it("returns a single entry untouched (no commas)", () => {
@@ -64,5 +65,37 @@ describe("mergeHotwords", () => {
 
   it("returns the original list when no new entries", () => {
     expect(mergeHotwords(["Claude"], [])).toEqual(["Claude"]);
+  });
+});
+
+describe("cloneBuiltinGroup", () => {
+  const source: HotwordGroup = {
+    id: "default",
+    name: "默认热词表",
+    words: ["Claude", "Anthropic|8"],
+  };
+
+  it("assigns a new id different from the source", () => {
+    const clone = cloneBuiltinGroup(source);
+    expect(clone.id).not.toBe(source.id);
+    expect(clone.id).toBeTruthy();
+  });
+
+  it("copies name and words verbatim", () => {
+    const clone = cloneBuiltinGroup(source);
+    expect(clone.name).toBe(source.name);
+    expect(clone.words).toEqual(source.words);
+  });
+
+  it("uses an independent words array (mutating the clone does not affect the source)", () => {
+    const clone = cloneBuiltinGroup(source);
+    clone.words.push("新词");
+    expect(source.words).toEqual(["Claude", "Anthropic|8"]);
+  });
+
+  it("produces distinct ids across calls", () => {
+    const a = cloneBuiltinGroup(source);
+    const b = cloneBuiltinGroup(source);
+    expect(a.id).not.toBe(b.id);
   });
 });

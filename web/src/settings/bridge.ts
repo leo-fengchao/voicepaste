@@ -11,6 +11,7 @@
 
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import type { HotwordData } from "@/settings/types/hotwords";
 
 // ---- Types ----
 
@@ -302,10 +303,18 @@ export async function deleteModel(modelId: string): Promise<void> {
 
 // ---- Hotword management ----
 
-export async function loadHotwords(): Promise<unknown> {
+/** Load the user's custom hotword library from user data. */
+export async function loadHotwords(): Promise<HotwordData> {
   return invoke("load_hotwords");
 }
 
-export async function saveHotwords(data: unknown): Promise<void> {
+/** Save the user's custom hotword library to user data. */
+export async function saveHotwords(data: HotwordData): Promise<void> {
   return invoke("save_hotwords", { data });
+}
+
+/** Load built-in hotword tables from the bundled app resource (read-only).
+ * Never touches user data — used by the "常用热词表" picker. */
+export async function loadBuiltinHotwords(): Promise<HotwordData> {
+  return invoke("load_builtin_hotwords");
 }

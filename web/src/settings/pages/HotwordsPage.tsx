@@ -1,9 +1,10 @@
 import { Trash } from "lucide-react";
 import { useCallback, useEffect, useState } from "react";
-import { loadHotwords, saveHotwords } from "@/settings/bridge";
+import { loadBuiltinHotwords, loadHotwords, saveHotwords } from "@/settings/bridge";
 import { Badge } from "@/settings/components/Badge";
 import { Button } from "@/settings/components/Button";
 import { Input } from "@/settings/components/Input";
+import { Modal } from "@/settings/components/Modal";
 import { Toggle } from "@/settings/components/Toggle";
 import {
   PageHeader,
@@ -14,15 +15,19 @@ import {
   SectionItem,
   SectionItemList,
 } from "@/settings/layout/PageLayout";
-import { mergeHotwords, parseHotwordInput } from "@/settings/lib/hotwords";
+import { cloneBuiltinGroup, mergeHotwords, parseHotwordInput } from "@/settings/lib/hotwords";
 import type { HotwordData, HotwordGroup } from "@/settings/types/hotwords";
 
 export function HotwordsPage() {
-  const [data, setData] = useState<HotwordData>({ active_group: "", groups: [] });
+  const [data, setData] = useState<HotwordData>({
+    active_group: "",
+    groups: [],
+  });
+  const [builtinOpen, setBuiltinOpen] = useState(false);
 
   const load = useCallback(async () => {
     try {
-      const hw = (await loadHotwords()) as unknown as HotwordData;
+      const hw = await loadHotwords();
       if (hw) setData(hw);
     } catch {
       /* ignore */
@@ -60,19 +65,29 @@ export function HotwordsPage() {
     const id = crypto.randomUUID();
     persist({
       ...data,
-      groups: [...data.groups, { id, name: "新热词组", words: [] }],
+      groups: [...data.groups, { id, name: "新热词表", words: [] }],
     });
+  };
+
+  // Clone a built-in table (fresh id) into the custom library.
+  const addClonedGroup = (group: HotwordGroup) => {
+    persist({ ...data, groups: [...data.groups, group] });
   };
 
   return (
     <PageLayout>
       <PageHeader
         title="热词库"
-        description="热词库用于提高特定词汇的识别准确率。开启开关的组为默认热词组，识别时自动传入；若模型不支持热词可追加到 LLM 文本润色，配置前往 音频模型 > 自定义配置 > 识别强化。"
+        description="热词库用于提高特定词汇的识别准确率。开启开关的表为默认热词表，识别时自动传入；若模型不支持热词可追加到 LLM 文本润色，配置前往 音频模型 > 自定义配置 > 识别强化。内置热词表可在「常用热词表」中按需添加为自定义表。"
       />
-      <Button variant="accent" onClick={addGroup}>
-        添加热词组
-      </Button>
+      <div className="flex items-center justify-between">
+        <Button variant="accent" onClick={addGroup}>
+          添加热词表
+        </Button>
+        <Button variant="default" onClick={() => setBuiltinOpen(true)}>
+          常用热词表
+        </Button>
+      </div>
       {data.groups.map((group) => (
         <HotwordGroupItem
           key={group.id}
@@ -83,6 +98,11 @@ export function HotwordsPage() {
           onSetActive={() => setActiveGroup(group.id)}
         />
       ))}
+      <BuiltinHotwordsModal
+        open={builtinOpen}
+        onClose={() => setBuiltinOpen(false)}
+        onAdd={addClonedGroup}
+      />
     </PageLayout>
   );
 }
@@ -105,7 +125,7 @@ function HotwordGroupItem({
   return (
     <Section>
       <SectionHeader
-        title={group.name || "未命名热词组"}
+        title={group.name}
         action={
           <div className="flex items-center gap-2">
             <Button size="icon" onClick={onRemove}>
@@ -170,5 +190,77 @@ function HotwordGroupItem({
         </SectionItemList>
       </SectionContent>
     </Section>
+  );
+}
+
+/** Max words shown as preview badges per built-in table. */
+const PREVIEW_WORDS = 8;
+
+interface BuiltinHotwordsModalProps {
+  open: boolean;
+  onClose: () => void;
+  /** Called with a fresh custom group cloned from the chosen built-in table. */
+  onAdd: (group: HotwordGroup) => void;
+}
+
+/**
+ * Picker for built-in hotword tables. Reads the bundled `hotwords.json` from
+ * the app resource (never user data) via `loadBuiltinHotwords`, and lets the
+ * user clone any built-in table into a new custom table. The clone gets a fresh
+ * id so it is fully independent — editing/deleting it can never be re-merged
+ * from the built-in library on a future app update.
+ */
+function BuiltinHotwordsModal({ open, onClose, onAdd }: BuiltinHotwordsModalProps) {
+  const [groups, setGroups] = useState<HotwordGroup[]>([]);
+
+  useEffect(() => {
+    if (!open) return;
+    loadBuiltinHotwords()
+      .then((data) => setGroups(data.groups))
+      .catch(() => setGroups([]));
+  }, [open]);
+
+  return (
+    <Modal open={open} onClose={onClose} title="常用热词表">
+      <div className="space-y-3 overscroll-y-auto">
+        {groups.length === 0 ? (
+          <p className="text-text-muted">暂无内置热词表。</p>
+        ) : (
+          groups.map((group) => {
+            const preview = group.words.slice(0, PREVIEW_WORDS);
+            const rest = group.words.length - preview.length;
+            return (
+              <Section key={group.id}>
+                <SectionHeader
+                  title={group.name}
+                  action={
+                    <Button
+                      variant="accent"
+                      onClick={() => {
+                        onAdd(cloneBuiltinGroup(group));
+                        onClose();
+                      }}
+                    >
+                      添加
+                    </Button>
+                  }
+                />
+
+                <SectionContent>
+                  <div className="flex flex-wrap gap-2">
+                    {preview.map((word) => (
+                      <Badge key={word} variant="muted">
+                        {word}
+                      </Badge>
+                    ))}
+                    {rest > 0 && <Badge variant="muted">+{rest}</Badge>}
+                  </div>
+                </SectionContent>
+              </Section>
+            );
+          })
+        )}
+      </div>
+    </Modal>
   );
 }

@@ -165,6 +165,7 @@ pub fn run() {
             commands::get_config_path,
             commands::load_hotwords,
             commands::save_hotwords,
+            commands::load_builtin_hotwords,
             commands::get_model_registry,
             commands::get_downloaded_models,
             commands::download_model,

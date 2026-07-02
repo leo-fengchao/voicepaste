@@ -2,10 +2,9 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://voicepaste.local/schemas/hotwords.schema.json",
   "type": "object",
-  "required": ["active_group", "groups"],
+  "required": ["groups"],
   "additionalProperties": false,
   "properties": {
-    "active_group": { "type": "string" },
     "groups": {
       "type": "array",
       "items": {
