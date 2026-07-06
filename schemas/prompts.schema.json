@@ -10,10 +10,7 @@
       "id": { "type": "string" },
       "default_add": { "type": "boolean" },
       "title": { "type": "string" },
-      "hotkey": {
-        "type": "array",
-        "items": { "type": ["string", "integer"] }
-      },
+      "hotkey": { "type": "string" },
       "hotkey_mode": { "type": "string", "enum": ["toggle", "hold"] },
       "prompt": { "type": "string" }
     }

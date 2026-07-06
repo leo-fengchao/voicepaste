@@ -197,20 +197,6 @@ fn digit_to_key(c: char) -> Option<Key> {
     }
 }
 
-/// Parse a prompt hotkey YAML value, stored as a string array like
-/// `["Control+Shift+A"]`. Returns the parsed key set, or `None` when the value
-/// is absent, empty, or not a string array.
-///
-/// The v1.x (Electron) format stored evdev/uIOhook keycode arrays
-/// (`[29, 54, 4]`). Those are converted to accelerator strings once, at upgrade
-/// time, by `migration::migrate_prompts` — runtime parsing intentionally does
-/// not understand the legacy numeric form, so this module holds no keycode
-/// tables and cannot misinterpret them.
-pub fn parse_prompt_hotkey_to_keys(hotkey: &serde_norway::Value) -> Option<BTreeSet<Key>> {
-    let seq = hotkey.as_sequence()?;
-    parse_hotkey_string(seq.first()?.as_str()?)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -462,40 +448,5 @@ mod tests {
     fn parse_mixed_case_modifier() {
         let keys = parse_hotkey_string("SHIFT+A").unwrap();
         assert_eq!(keys, BTreeSet::from([Key::ShiftLeft, Key::A]));
-    }
-
-    // ── parse_prompt_hotkey_to_keys tests ──────────────────────────────────
-
-    fn make_str_seq(items: &[&str]) -> serde_norway::Value {
-        serde_norway::Value::Sequence(
-            items
-                .iter()
-                .map(|s| serde_norway::Value::String(s.to_string()))
-                .collect(),
-        )
-    }
-
-    #[test]
-    fn parse_prompt_hotkey_string_format() {
-        let hotkey = make_str_seq(&["Control+Shift+A"]);
-        let keys = parse_prompt_hotkey_to_keys(&hotkey).unwrap();
-        assert_eq!(
-            keys,
-            BTreeSet::from([Key::ControlLeft, Key::ShiftLeft, Key::A])
-        );
-    }
-
-    #[test]
-    fn parse_prompt_hotkey_empty_sequence() {
-        let hotkey = serde_norway::Value::Sequence(vec![]);
-        assert_eq!(parse_prompt_hotkey_to_keys(&hotkey), None);
-    }
-
-    #[test]
-    fn parse_prompt_hotkey_null_returns_none() {
-        assert_eq!(
-            parse_prompt_hotkey_to_keys(&serde_norway::Value::Null),
-            None
-        );
     }
 }

@@ -285,11 +285,12 @@ pub struct PromptItem {
     pub id: String,
     #[serde(default)]
     pub title: String,
-    /// Hotkey array — supports two formats:
-    /// - Legacy uIOhook keycodes: `[29, 54, 4]` (numbers)
-    /// - New accelerator strings: `["Control+Shift+A"]` (strings)
+    /// Hotkey as a `+`-joined accelerator string, e.g. `"ControlLeft+ShiftLeft"`
+    /// or `"F13"`. Mirrors the main hotkey (`config.app.hotkey`) so both share
+    /// `parse_hotkey_string`. Legacy array/numeric forms are normalized to this
+    /// string form on read (see `hotkey_value_to_string`).
     #[serde(default)]
-    pub hotkey: serde_norway::Value,
+    pub hotkey: String,
     #[serde(default = "default_hotkey_mode")]
     pub hotkey_mode: String,
     #[serde(default)]
@@ -855,12 +856,26 @@ impl Default for AppConfig {
 
 // -- Prompt helpers --
 
+/// Coerce a stored hotkey value into the canonical string form. Accepts the
+/// new string form directly, and the legacy array form (`["A+B"]` or
+/// `["A","B"]`) by joining elements with "+". Legacy numeric arrays
+/// (`[29, 54, 4]`) drop their numbers → `""` (v2 user data never carries them;
+/// `migration::migrate_prompts` already converted v1). Legacy compat — once
+/// all user data is migrated to strings this can collapse to `as_str`.
+fn hotkey_value_to_string(v: Option<&serde_norway::Value>) -> String {
+    match v {
+        Some(serde_norway::Value::String(s)) => s.clone(),
+        Some(serde_norway::Value::Sequence(seq)) => seq
+            .iter()
+            .filter_map(|x| x.as_str())
+            .collect::<Vec<_>>()
+            .join("+"),
+        _ => String::new(),
+    }
+}
+
 fn normalize_prompt_item(item: &serde_norway::Value, index: usize) -> PromptItem {
     let fallback_id = format!("prompt-{}", index + 1);
-    let hotkey_value = item
-        .get("hotkey")
-        .cloned()
-        .unwrap_or(serde_norway::Value::Sequence(vec![]));
 
     PromptItem {
         id: item
@@ -874,7 +889,7 @@ fn normalize_prompt_item(item: &serde_norway::Value, index: usize) -> PromptItem
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string(),
-        hotkey: hotkey_value,
+        hotkey: hotkey_value_to_string(item.get("hotkey")),
         hotkey_mode: if item
             .get("hotkey_mode")
             .and_then(|v| v.as_str())
@@ -979,8 +994,16 @@ impl ConfigManager {
         // Load config into memory cache
         let config = Self::read_config_from_disk(&config_path);
 
-        // Load prompts into memory cache (read-only, no default merge)
-        let prompts = Self::read_prompts_from_disk(&prompts_path);
+        // Load prompts into memory cache (read-only, no default merge).
+        let (prompts, prompts_dirty) = Self::read_prompts_from_disk(&prompts_path);
+        // One-shot migration: if any stored hotkey was in the legacy array
+        // form, rewrite the file so on-disk data is uniformly the string form.
+        // Idempotent — next startup reads strings, dirty is false.
+        if prompts_dirty {
+            if let Ok(json) = serde_json::to_string_pretty(&prompts) {
+                let _ = fs::write(&prompts_path, json);
+            }
+        }
 
         Self {
             config_path,
@@ -1002,17 +1025,27 @@ impl ConfigManager {
 
     /// Read prompts from disk into typed items. Read-only — never merges
     /// built-in defaults back in, so user deletions persist across restarts.
-    fn read_prompts_from_disk(prompts_path: &Path) -> Vec<PromptItem> {
+    /// Returns the items plus a `dirty` flag that is true when any stored
+    /// hotkey was in the legacy array form and got normalized to a string — the
+    /// caller persists the result so the on-disk format becomes uniform.
+    fn read_prompts_from_disk(prompts_path: &Path) -> (Vec<PromptItem>, bool) {
         let content = match fs::read_to_string(prompts_path) {
             Ok(c) => c,
-            Err(_) => return Vec::new(),
+            Err(_) => return (Vec::new(), false),
         };
         let parsed: Vec<serde_norway::Value> = serde_json::from_str(&content).unwrap_or_default();
-        parsed
+        let mut dirty = false;
+        let items: Vec<PromptItem> = parsed
             .iter()
             .enumerate()
-            .map(|(i, v)| normalize_prompt_item(v, i))
-            .collect()
+            .map(|(i, v)| {
+                if v.get("hotkey").is_some_and(|h| h.is_sequence()) {
+                    dirty = true;
+                }
+                normalize_prompt_item(v, i)
+            })
+            .collect();
+        (items, dirty)
     }
 
     /// Load config from memory cache (no disk I/O).
@@ -1304,6 +1337,46 @@ min_silence_duration: 0.3
         assert!(!item.default_add);
     }
 
+    // ── hotkey_value_to_string (legacy array → string) ─────────────────
+
+    #[test]
+    fn hotkey_value_to_string_passes_string_through() {
+        let v = to_norway(serde_json::json!("ControlLeft+ShiftLeft"));
+        assert_eq!(hotkey_value_to_string(Some(&v)), "ControlLeft+ShiftLeft");
+    }
+
+    #[test]
+    fn hotkey_value_to_string_joins_single_element_array() {
+        let v = to_norway(serde_json::json!(["Control+Space"]));
+        assert_eq!(hotkey_value_to_string(Some(&v)), "Control+Space");
+    }
+
+    #[test]
+    fn hotkey_value_to_string_joins_multi_element_array() {
+        let v = to_norway(serde_json::json!(["ControlLeft", "ShiftLeft"]));
+        assert_eq!(hotkey_value_to_string(Some(&v)), "ControlLeft+ShiftLeft");
+    }
+
+    #[test]
+    fn hotkey_value_to_string_empty_array_to_empty_string() {
+        let v = to_norway(serde_json::json!([]));
+        assert_eq!(hotkey_value_to_string(Some(&v)), "");
+    }
+
+    #[test]
+    fn hotkey_value_to_string_none_to_empty_string() {
+        assert_eq!(hotkey_value_to_string(None), "");
+    }
+
+    #[test]
+    fn hotkey_value_to_string_numeric_array_drops_numbers() {
+        // Legacy v1 evdev arrays ([29, 54, 4]) — numbers aren't strings, so
+        // they drop → "". v2 user data never carries these (migration already
+        // converted); this is just defensive.
+        let v = to_norway(serde_json::json!([29, 54]));
+        assert_eq!(hotkey_value_to_string(Some(&v)), "");
+    }
+
     // ── ConfigManager: first-run seeding & no-merge ─────────────────────
 
     fn write_builtin_prompts(resource_dir: &std::path::Path, items: &[PromptItem]) {
@@ -1315,7 +1388,7 @@ min_silence_duration: 0.3
         PromptItem {
             id: id.to_string(),
             title: id.to_string(),
-            hotkey: serde_norway::Value::Sequence(vec![]),
+            hotkey: String::new(),
             hotkey_mode: "toggle".to_string(),
             prompt: format!("prompt-{id}"),
             default_add,
@@ -1373,5 +1446,32 @@ min_silence_duration: 0.3
         // Re-construct (simulate restart): the deleted prompt must NOT reappear.
         let mgr2 = ConfigManager::new(data_dir.path(), resource_dir.path());
         assert!(mgr2.load_prompts().is_empty());
+    }
+
+    #[test]
+    fn new_migrates_legacy_array_hotkey_on_startup() {
+        let data_dir = tempfile::tempdir().unwrap();
+        let resource_dir = tempfile::tempdir().unwrap();
+        // User data with a legacy array-form hotkey.
+        std::fs::write(
+            data_dir.path().join("prompts.json"),
+            r#"[{"id":"p1","title":"T","hotkey":["ControlLeft+ShiftLeft"],"hotkey_mode":"toggle","prompt":"x"}]"#,
+        )
+        .unwrap();
+
+        let mgr = ConfigManager::new(data_dir.path(), resource_dir.path());
+        // Cache is normalized to the string form.
+        assert_eq!(mgr.load_prompts()[0].hotkey, "ControlLeft+ShiftLeft");
+
+        // On-disk file has been rewritten to the string form (no array left).
+        let on_disk = std::fs::read_to_string(data_dir.path().join("prompts.json")).unwrap();
+        assert!(on_disk.contains("ControlLeft+ShiftLeft"));
+        assert!(!on_disk.contains(r#""hotkey": ["#));
+
+        // Idempotent: a second construction keeps the string form intact.
+        let _mgr2 = ConfigManager::new(data_dir.path(), resource_dir.path());
+        let on_disk2 = std::fs::read_to_string(data_dir.path().join("prompts.json")).unwrap();
+        assert!(on_disk2.contains("ControlLeft+ShiftLeft"));
+        assert!(!on_disk2.contains(r#""hotkey": ["#));
     }
 }

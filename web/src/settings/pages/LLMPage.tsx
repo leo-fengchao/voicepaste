@@ -233,7 +233,7 @@ export function LLMPage() {
                 {
                   id: createPromptId(),
                   title: "新建润色模板",
-                  hotkey: [],
+                  hotkey: "",
                   hotkey_mode: "toggle",
                   prompt: "",
                 },

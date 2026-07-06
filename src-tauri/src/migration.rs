@@ -228,8 +228,8 @@ fn migrate_llm_section(legacy_llm: Option<Mapping>, out: &mut Mapping) {
 }
 
 /// Migrate `prompts.json`: structure is unchanged, only each template's hotkey
-/// (evdev int array) is converted to the 2.x string-array form. Unbound or
-/// unmappable → empty array.
+/// (evdev int array) is converted to the 2.x string form. Unbound or
+/// unmappable → empty string.
 fn migrate_prompts(src: &Path, dst: &Path) -> Result<(), String> {
     if !src.exists() {
         return Ok(());
@@ -355,11 +355,11 @@ fn convert_json_hotkey(v: &serde_json::Value) -> serde_json::Value {
             .iter()
             .filter_map(|n| n.as_u64().map(|x| x as u32))
             .collect(),
-        _ => return serde_json::Value::Array(Vec::new()),
+        _ => return serde_json::Value::String(String::new()),
     };
     match evdev_to_accelerator(&codes) {
-        Some(s) => serde_json::Value::Array(vec![serde_json::Value::String(s)]),
-        None => serde_json::Value::Array(Vec::new()),
+        Some(s) => serde_json::Value::String(s),
+        None => serde_json::Value::String(String::new()),
     }
 }
 
@@ -735,7 +735,7 @@ llm:
         let tmp = TempDir::new().unwrap();
         let src = tmp.path().join("prompts.json");
         let dst = tmp.path().join("out.json");
-        // [29, 30] = Ctrl+A → ["Control+A"]; [] stays []; [29,42] (no normal) → []
+        // [29, 30] = Ctrl+A → "Control+A"; [] → ""; [29,42] (no normal) → ""
         fs::write(
             &src,
             r#"[
@@ -751,9 +751,9 @@ llm:
         let arr: serde_json::Value =
             serde_json::from_str(&fs::read_to_string(&dst).unwrap()).unwrap();
         let arr = arr.as_array().unwrap();
-        assert_eq!(arr[0]["hotkey"], serde_json::json!(["Control+A"]));
-        assert_eq!(arr[1]["hotkey"], serde_json::json!([]));
-        assert_eq!(arr[2]["hotkey"], serde_json::json!([]));
+        assert_eq!(arr[0]["hotkey"], serde_json::json!("Control+A"));
+        assert_eq!(arr[1]["hotkey"], serde_json::json!(""));
+        assert_eq!(arr[2]["hotkey"], serde_json::json!(""));
     }
 
     #[test]

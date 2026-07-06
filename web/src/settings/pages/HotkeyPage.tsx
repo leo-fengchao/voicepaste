@@ -56,11 +56,11 @@ export function HotkeyPage() {
       if (result.hotkey) {
         updated[index] = {
           ...updated[index],
-          hotkey: [result.hotkey],
+          hotkey: result.hotkey,
           _displayString: result.displayString,
         };
       } else {
-        updated[index] = { ...updated[index], hotkey: [] };
+        updated[index] = { ...updated[index], hotkey: "" };
         delete updated[index]._displayString;
       }
       setPrompts(updated);

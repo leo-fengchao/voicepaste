@@ -13,7 +13,7 @@ export function cloneBuiltinPrompt(item: PromptItem): PromptItem {
   return {
     id: crypto.randomUUID(),
     title: item.title,
-    hotkey: Array.isArray(item.hotkey) ? [...item.hotkey] : [],
+    hotkey: item.hotkey,
     hotkey_mode: item.hotkey_mode,
     prompt: item.prompt,
   };

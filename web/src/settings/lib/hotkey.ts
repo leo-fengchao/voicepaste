@@ -82,6 +82,5 @@ export function normalizeHotkeyToken(key: string, isMac = true): HotkeyToken {
  * entries are dropped (defensive against malformed stored data).
  */
 export function formatPromptHotkey(hotkey: unknown): string {
-  if (!Array.isArray(hotkey) || hotkey.length === 0) return "";
-  return hotkey.filter((key): key is string => typeof key === "string").join(" + ");
+  return typeof hotkey === "string" ? hotkey : "";
 }

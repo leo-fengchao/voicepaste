@@ -2,9 +2,9 @@
 export interface PromptItem {
   id: string;
   title: string;
-  /** Accelerator string array, e.g. ["Control+Shift+A"]. Legacy numeric
-   * keycodes are tolerated by the backend but the UI writes strings. */
-  hotkey?: string[];
+  /** `+`-joined accelerator string, e.g. "ControlLeft+ShiftLeft" or "F13".
+   * Mirrors the main hotkey format. Empty string = unbound. */
+  hotkey?: string;
   hotkey_mode?: string;
   prompt?: string;
   /** Built-in classifier: true → auto-seeded for new users. Only present on

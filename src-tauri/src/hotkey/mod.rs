@@ -25,7 +25,7 @@ use crate::config::PromptItem;
 pub use label::current_hotkey_label;
 pub use listener::{ensure_hotkey_active, reset_recording};
 pub use matcher::MatcherState;
-pub use parse::{parse_hotkey_string, parse_prompt_hotkey_to_keys};
+pub use parse::parse_hotkey_string;
 pub(crate) use recorder::record_combination;
 
 // ---------------------------------------------------------------------------
@@ -143,16 +143,16 @@ pub fn reload_bindings(
 
     // Prompt hotkeys
     for prompt in prompts {
-        if let Some(keys) = parse_prompt_hotkey_to_keys(&prompt.hotkey) {
+        if let Some(keys) = parse_hotkey_string(&prompt.hotkey) {
             new_bindings.push(HotkeyBinding {
                 keys,
                 mode: HotkeyMode::from_str(&prompt.hotkey_mode),
                 prompt_id: Some(prompt.id.clone()),
             });
-        } else if !prompt.hotkey.is_sequence() || !prompt.hotkey.as_sequence().unwrap().is_empty() {
+        } else if !prompt.hotkey.is_empty() {
             log_hotkey!(
                 warn,
-                "Prompt '{}' hotkey {:?} could not be parsed, skipping",
+                "Prompt '{}' hotkey '{}' could not be parsed, skipping",
                 prompt.title,
                 prompt.hotkey
             );
@@ -264,7 +264,7 @@ fn build_initial_bindings(
     }
 
     for prompt in prompts {
-        if let Some(keys) = parse_prompt_hotkey_to_keys(&prompt.hotkey) {
+        if let Some(keys) = parse_hotkey_string(&prompt.hotkey) {
             bindings.push(HotkeyBinding {
                 keys,
                 mode: HotkeyMode::from_str(&prompt.hotkey_mode),
@@ -282,15 +282,6 @@ mod tests {
     use keytap::Key;
     use std::collections::BTreeSet;
 
-    fn make_str_seq(items: &[&str]) -> serde_norway::Value {
-        serde_norway::Value::Sequence(
-            items
-                .iter()
-                .map(|s| serde_norway::Value::String(s.to_string()))
-                .collect(),
-        )
-    }
-
     fn make_binding(keys: BTreeSet<Key>, mode: &str) -> HotkeyBinding {
         HotkeyBinding {
             keys,
@@ -299,11 +290,11 @@ mod tests {
         }
     }
 
-    fn make_prompt_item(id: &str, hotkey: serde_norway::Value) -> PromptItem {
+    fn make_prompt_item(id: &str, hotkey: &str) -> PromptItem {
         PromptItem {
             id: id.to_string(),
             title: "Test".to_string(),
-            hotkey,
+            hotkey: hotkey.to_string(),
             hotkey_mode: "hold".to_string(),
             prompt: "Be concise".to_string(),
             default_add: false,
@@ -332,7 +323,7 @@ mod tests {
 
     #[test]
     fn build_main_plus_prompts() {
-        let prompt = make_prompt_item("p1", make_str_seq(&["Control+Shift+P"]));
+        let prompt = make_prompt_item("p1", "Control+Shift+P");
         let bindings = build_initial_bindings("F13", "toggle", &[prompt]);
         assert_eq!(bindings.len(), 2);
         assert_eq!(bindings[0].prompt_id, None);
@@ -342,7 +333,7 @@ mod tests {
 
     #[test]
     fn build_skips_prompt_with_empty_hotkey() {
-        let prompt = make_prompt_item("p1", serde_norway::Value::Sequence(vec![]));
+        let prompt = make_prompt_item("p1", "");
         let bindings = build_initial_bindings("F13", "toggle", &[prompt]);
         assert_eq!(bindings.len(), 1);
     }
@@ -446,7 +437,7 @@ mod tests {
     #[test]
     fn reload_with_prompts() {
         let config = create_config(vec![]);
-        let prompt = make_prompt_item("p1", make_str_seq(&["Control+Shift+P"]));
+        let prompt = make_prompt_item("p1", "Control+Shift+P");
 
         reload_bindings(&config, "F13", "toggle", &[prompt]);
         {

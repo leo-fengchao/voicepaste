@@ -6,7 +6,7 @@ describe("cloneBuiltinPrompt", () => {
   const source: PromptItem = {
     id: "prompt-general",
     title: "通用整理",
-    hotkey: ["ControlLeft+ShiftLeft"],
+    hotkey: "ControlLeft+ShiftLeft",
     hotkey_mode: "toggle",
     prompt: "整理语音转写内容",
     default_add: true,
@@ -25,11 +25,9 @@ describe("cloneBuiltinPrompt", () => {
     expect(clone.prompt).toBe(source.prompt);
   });
 
-  it("copies hotkey into an independent array", () => {
+  it("copies hotkey verbatim", () => {
     const clone = cloneBuiltinPrompt(source);
-    expect(clone.hotkey).toEqual(source.hotkey);
-    clone.hotkey?.push("X");
-    expect(source.hotkey).toEqual(["ControlLeft+ShiftLeft"]);
+    expect(clone.hotkey).toBe(source.hotkey);
   });
 
   it("drops the built-in default_add flag", () => {

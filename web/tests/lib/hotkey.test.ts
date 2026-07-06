@@ -63,19 +63,16 @@ describe("normalizeHotkeyLabel", () => {
 });
 
 describe("formatPromptHotkey", () => {
-  it("returns empty for non-array", () => {
+  it("returns the string as-is for a string hotkey", () => {
+    expect(formatPromptHotkey("ControlLeft+ShiftLeft")).toBe("ControlLeft+ShiftLeft");
+    expect(formatPromptHotkey("F13")).toBe("F13");
+    expect(formatPromptHotkey("")).toBe("");
+  });
+  it("returns empty for non-string (null/undefined/array/number)", () => {
     expect(formatPromptHotkey(null)).toBe("");
     expect(formatPromptHotkey(undefined)).toBe("");
-    expect(formatPromptHotkey("string")).toBe("");
-  });
-  it("returns empty for empty array", () => {
-    expect(formatPromptHotkey([])).toBe("");
-  });
-  it("joins string format hotkeys", () => {
-    expect(formatPromptHotkey(["Control", "Shift", "A"])).toBe("Control + Shift + A");
-  });
-  it("returns single key without separator", () => {
-    expect(formatPromptHotkey(["F13"])).toBe("F13");
+    expect(formatPromptHotkey(["Control", "Shift", "A"])).toBe("");
+    expect(formatPromptHotkey(42)).toBe("");
   });
 });
 
