@@ -29,6 +29,11 @@ export function HotkeyPage() {
   const [prompts, setPrompts] = useState<PromptItem[]>([]);
   const [recordingIdx, setRecordingIdx] = useState<number | null>(null);
 
+  // Any recording in progress (main or prompt) disables all record buttons —
+  // the backend keytap recorder handles one combination at a time, so letting
+  // a second recording start would race with the in-flight one.
+  const anyRecording = recording || recordingIdx !== null;
+
   useEffect(() => {
     loadPrompts()
       .then((d) => {
@@ -93,7 +98,7 @@ export function HotkeyPage() {
                       return <KeyCap key={k} label={token.main} side={token.side} />;
                     })}
                   </div>
-                  <Button variant="accent" onClick={startRecord} disabled={recording}>
+                  <Button variant="accent" onClick={startRecord} disabled={anyRecording}>
                     {recording ? "请按键…" : "录制"}
                   </Button>
                   <SegmentedControl
@@ -130,7 +135,7 @@ export function HotkeyPage() {
                     </div>
                     <Button
                       variant="accent"
-                      disabled={recordingIdx !== null}
+                      disabled={anyRecording}
                       onClick={() => recordPromptHotkey(idx)}
                     >
                       {recordingIdx === idx ? "录制中…" : "录制"}
