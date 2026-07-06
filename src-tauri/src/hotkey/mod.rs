@@ -306,6 +306,7 @@ mod tests {
             hotkey,
             hotkey_mode: "hold".to_string(),
             prompt: "Be concise".to_string(),
+            default_add: false,
         }
     }
 

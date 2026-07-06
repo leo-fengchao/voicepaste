@@ -30,6 +30,7 @@ import {
   getModelRegistry,
   getStats,
   loadBuiltinHotwords,
+  loadBuiltinPrompts,
   loadHotwords,
   loadPrompts,
   onEvent,
@@ -105,6 +106,11 @@ describe("settings bridge — data methods", () => {
   it("loadPrompts invokes load_prompts", async () => {
     await loadPrompts();
     expect(invoke).toHaveBeenCalledWith("load_prompts");
+  });
+
+  it("loadBuiltinPrompts invokes load_builtin_prompts", async () => {
+    await loadBuiltinPrompts();
+    expect(invoke).toHaveBeenCalledWith("load_builtin_prompts");
   });
 
   it("savePrompts invokes save_prompts", async () => {

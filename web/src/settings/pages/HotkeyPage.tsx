@@ -14,15 +14,7 @@ import {
 } from "@/settings/layout/PageLayout";
 import { formatPromptHotkey, normalizeHotkeyToken } from "@/settings/lib/hotkey";
 import { useSettings } from "@/settings/SettingsProvider";
-
-interface PromptItem {
-  id: string;
-  title: string;
-  hotkey?: string[];
-  hotkey_mode?: string;
-  prompt?: string;
-  _displayString?: string;
-}
+import type { PromptItem } from "@/settings/types/prompts";
 
 export function HotkeyPage() {
   const { settings, scheduleSave } = useSettings();

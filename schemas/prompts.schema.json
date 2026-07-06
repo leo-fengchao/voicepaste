@@ -8,6 +8,7 @@
     "additionalProperties": false,
     "properties": {
       "id": { "type": "string" },
+      "default_add": { "type": "boolean" },
       "title": { "type": "string" },
       "hotkey": {
         "type": "array",

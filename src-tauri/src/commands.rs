@@ -236,6 +236,13 @@ pub async fn load_prompts(state: State<'_, AppState>) -> Result<Vec<PromptItem>,
     Ok(state.config_manager.load_prompts())
 }
 
+/// Load built-in prompt templates from the bundled app resource (read-only).
+/// Used by the "常用润色提示词" picker; never touches user data.
+#[tauri::command]
+pub async fn load_builtin_prompts(state: State<'_, AppState>) -> Result<Vec<PromptItem>, String> {
+    Ok(state.config_manager.load_builtin_prompts())
+}
+
 /// Save prompts and reload shortcuts so prompt hotkeys take effect immediately.
 #[tauri::command]
 pub async fn save_prompts(

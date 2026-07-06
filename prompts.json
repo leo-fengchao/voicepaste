@@ -1,6 +1,7 @@
 [
   {
     "id": "prompt-general",
+    "default_add": true,
     "title": "通用整理",
     "hotkey": ["ControlLeft+ShiftLeft"],
     "hotkey_mode": "toggle",

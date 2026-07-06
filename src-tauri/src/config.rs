@@ -273,6 +273,13 @@ pub struct ProviderConfig {
     pub model: String,
 }
 
+/// `true` only for built-in templates auto-seeded into a new user's library on
+/// first run. Used by `skip_serializing_if` so the field stays out of user data
+/// (where it is always false) — only the bundled `prompts.json` carries `true`.
+fn is_false(b: &bool) -> bool {
+    !b
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PromptItem {
     pub id: String,
@@ -287,6 +294,12 @@ pub struct PromptItem {
     pub hotkey_mode: String,
     #[serde(default)]
     pub prompt: String,
+    /// Built-in classifier: true → auto-seed for new users. Stripped from user
+    /// data via `skip_serializing_if`; defaults to false for user-created and
+    /// legacy templates.
+    #[serde(default)]
+    #[serde(skip_serializing_if = "is_false")]
+    pub default_add: bool,
 }
 
 // Default value functions
@@ -877,6 +890,10 @@ fn normalize_prompt_item(item: &serde_norway::Value, index: usize) -> PromptItem
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string(),
+        default_add: item
+            .get("default_add")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false),
     }
 }
 
@@ -909,6 +926,8 @@ fn load_default_prompts(example_path: &Option<PathBuf>) -> Vec<PromptItem> {
 pub struct ConfigManager {
     config_path: PathBuf,
     prompts_path: PathBuf,
+    /// Path to the bundled built-in `prompts.json` (read-only app resource).
+    builtin_prompts_path: PathBuf,
     cached_config: RwLock<AppConfig>,
     cached_prompts: RwLock<Vec<PromptItem>>,
 }
@@ -917,6 +936,7 @@ impl ConfigManager {
     pub fn new(data_dir: &Path, resource_dir: &Path) -> Self {
         let config_path = data_dir.join("config.yaml");
         let prompts_path = data_dir.join("prompts.json");
+        let builtin_prompts_path = resource_dir.join("prompts.json");
 
         let config_example_path = if resource_dir.join("config.yaml.example").exists() {
             Some(resource_dir.join("config.yaml.example"))
@@ -924,8 +944,8 @@ impl ConfigManager {
             None
         };
 
-        let prompts_example_path = if resource_dir.join("prompts.json").exists() {
-            Some(resource_dir.join("prompts.json"))
+        let prompts_example_path = if builtin_prompts_path.exists() {
+            Some(builtin_prompts_path.clone())
         } else {
             None
         };
@@ -937,24 +957,35 @@ impl ConfigManager {
             }
         }
 
-        // Ensure prompts file exists
+        // First run: seed only built-in templates marked `default_add` (e.g.
+        // "通用整理", which carries the default polish hotkey). Other built-ins
+        // stay in the "常用润色提示词" picker for on-demand add. The flag is
+        // stripped from seeded copies — it is a built-in-library classifier, not
+        // a user-data property. Existing users (file present) keep their data
+        // verbatim. Startup never merges defaults back in, so deletions persist.
         if !prompts_path.exists() {
-            if let Some(ref example) = prompts_example_path {
-                let _ = fs::copy(example, &prompts_path);
-            } else {
-                let _ = fs::write(&prompts_path, "[]");
-            }
+            let seeded: Vec<PromptItem> = load_default_prompts(&prompts_example_path)
+                .into_iter()
+                .filter(|p| p.default_add)
+                .map(|mut p| {
+                    p.default_add = false;
+                    p
+                })
+                .collect();
+            let json = serde_json::to_string_pretty(&seeded).unwrap_or_else(|_| "[]".to_string());
+            let _ = fs::write(&prompts_path, json);
         }
 
         // Load config into memory cache
         let config = Self::read_config_from_disk(&config_path);
 
-        // Load prompts into memory cache (with default merge logic)
-        let prompts = Self::read_and_merge_prompts(&prompts_path, &prompts_example_path);
+        // Load prompts into memory cache (read-only, no default merge)
+        let prompts = Self::read_prompts_from_disk(&prompts_path);
 
         Self {
             config_path,
             prompts_path,
+            builtin_prompts_path,
             cached_config: RwLock::new(config),
             cached_prompts: RwLock::new(prompts),
         }
@@ -969,44 +1000,19 @@ impl ConfigManager {
         serde_norway::from_str(&content).unwrap_or_default()
     }
 
-    /// Read prompts from disk, merge with defaults, and optionally save merged result.
-    fn read_and_merge_prompts(
-        prompts_path: &Path,
-        example_path: &Option<PathBuf>,
-    ) -> Vec<PromptItem> {
+    /// Read prompts from disk into typed items. Read-only — never merges
+    /// built-in defaults back in, so user deletions persist across restarts.
+    fn read_prompts_from_disk(prompts_path: &Path) -> Vec<PromptItem> {
         let content = match fs::read_to_string(prompts_path) {
             Ok(c) => c,
-            Err(_) => return load_default_prompts(example_path),
+            Err(_) => return Vec::new(),
         };
-
-        let parsed: Vec<serde_norway::Value> = match serde_json::from_str(&content) {
-            Ok(v) => v,
-            Err(_) => return load_default_prompts(example_path),
-        };
-
-        let mut prompts: Vec<PromptItem> = parsed
+        let parsed: Vec<serde_norway::Value> = serde_json::from_str(&content).unwrap_or_default();
+        parsed
             .iter()
             .enumerate()
             .map(|(i, v)| normalize_prompt_item(v, i))
-            .collect();
-
-        // Merge missing defaults
-        let defaults = load_default_prompts(example_path);
-        let existing_ids: std::collections::HashSet<String> =
-            prompts.iter().map(|p| p.id.clone()).collect();
-        let missing: Vec<PromptItem> = defaults
-            .into_iter()
-            .filter(|p| !existing_ids.contains(&p.id))
-            .collect();
-
-        if !missing.is_empty() {
-            prompts.extend(missing);
-            if let Ok(json) = serde_json::to_string_pretty(&prompts) {
-                let _ = fs::write(prompts_path, json);
-            }
-        }
-
-        prompts
+            .collect()
     }
 
     /// Load config from memory cache (no disk I/O).
@@ -1051,6 +1057,14 @@ impl ConfigManager {
             .map_err(|e| format!("Failed to write prompts: {}", e))?;
         *self.cached_prompts.write().unwrap() = prompts.to_vec();
         Ok(())
+    }
+
+    /// Load built-in prompt templates from the bundled app resource
+    /// (`prompts.json` in the resource dir). Read-only: never touches user
+    /// data. Used by the "常用润色提示词" picker so app updates refresh the
+    /// built-in library without affecting existing users.
+    pub fn load_builtin_prompts(&self) -> Vec<PromptItem> {
+        load_default_prompts(&Some(self.builtin_prompts_path.clone()))
     }
 }
 
@@ -1267,5 +1281,97 @@ min_silence_duration: 0.3
         let v = to_norway(json);
         let item = normalize_prompt_item(&v, 0);
         assert_eq!(item.hotkey_mode, "hold");
+    }
+
+    #[test]
+    fn normalize_prompt_item_default_add_true() {
+        let json = serde_json::json!({ "id": "p1", "default_add": true });
+        let item = normalize_prompt_item(&to_norway(json), 0);
+        assert!(item.default_add);
+    }
+
+    #[test]
+    fn normalize_prompt_item_default_add_absent_is_false() {
+        let json = serde_json::json!({ "id": "p1" });
+        let item = normalize_prompt_item(&to_norway(json), 0);
+        assert!(!item.default_add);
+    }
+
+    #[test]
+    fn normalize_prompt_item_default_add_non_bool_is_false() {
+        let json = serde_json::json!({ "id": "p1", "default_add": "yes" });
+        let item = normalize_prompt_item(&to_norway(json), 0);
+        assert!(!item.default_add);
+    }
+
+    // ── ConfigManager: first-run seeding & no-merge ─────────────────────
+
+    fn write_builtin_prompts(resource_dir: &std::path::Path, items: &[PromptItem]) {
+        let json = serde_json::to_string_pretty(items).unwrap();
+        std::fs::write(resource_dir.join("prompts.json"), json).unwrap();
+    }
+
+    fn builtin_prompt(id: &str, default_add: bool) -> PromptItem {
+        PromptItem {
+            id: id.to_string(),
+            title: id.to_string(),
+            hotkey: serde_norway::Value::Sequence(vec![]),
+            hotkey_mode: "toggle".to_string(),
+            prompt: format!("prompt-{id}"),
+            default_add,
+        }
+    }
+
+    #[test]
+    fn new_seeds_only_default_add_prompts_for_new_user() {
+        let data_dir = tempfile::tempdir().unwrap();
+        let resource_dir = tempfile::tempdir().unwrap();
+        write_builtin_prompts(
+            resource_dir.path(),
+            &[builtin_prompt("basic", true), builtin_prompt("adv", false)],
+        );
+
+        let mgr = ConfigManager::new(data_dir.path(), resource_dir.path());
+        let loaded = mgr.load_prompts();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].id, "basic");
+        // Seeded copy must not carry the built-in classifier.
+        assert!(!loaded[0].default_add);
+    }
+
+    #[test]
+    fn load_builtin_returns_all_with_flags() {
+        let data_dir = tempfile::tempdir().unwrap();
+        let resource_dir = tempfile::tempdir().unwrap();
+        write_builtin_prompts(
+            resource_dir.path(),
+            &[builtin_prompt("basic", true), builtin_prompt("adv", false)],
+        );
+
+        let mgr = ConfigManager::new(data_dir.path(), resource_dir.path());
+        let builtin = mgr.load_builtin_prompts();
+        assert_eq!(builtin.len(), 2);
+        assert!(builtin.iter().any(|p| p.id == "basic" && p.default_add));
+        assert!(builtin.iter().any(|p| p.id == "adv" && !p.default_add));
+        // load_builtin never seeds into user data — only the basic one is there.
+        assert_eq!(mgr.load_prompts().len(), 1);
+    }
+
+    #[test]
+    fn read_prompts_does_not_merge_back_deleted_builtins() {
+        let data_dir = tempfile::tempdir().unwrap();
+        let resource_dir = tempfile::tempdir().unwrap();
+        write_builtin_prompts(resource_dir.path(), &[builtin_prompt("basic", true)]);
+
+        // First run seeds the basic prompt.
+        let mgr = ConfigManager::new(data_dir.path(), resource_dir.path());
+        assert_eq!(mgr.load_prompts().len(), 1);
+
+        // User deletes it (writes an empty list to disk).
+        std::fs::write(data_dir.path().join("prompts.json"), "[]").unwrap();
+
+        // Re-construct (simulate restart): the deleted prompt must NOT reappear.
+        let mgr2 = ConfigManager::new(data_dir.path(), resource_dir.path());
+        assert!(mgr2.load_prompts().is_empty());
     }
 }

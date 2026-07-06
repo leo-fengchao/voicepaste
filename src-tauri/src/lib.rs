@@ -146,6 +146,7 @@ pub fn run() {
             commands::save_config_object,
             commands::load_prompts,
             commands::save_prompts,
+            commands::load_builtin_prompts,
             commands::get_stats,
             commands::get_history,
             commands::delete_history,

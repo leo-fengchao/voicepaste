@@ -12,6 +12,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import type { HotwordData } from "@/settings/types/hotwords";
+import type { PromptItem } from "@/settings/types/prompts";
 
 // ---- Types ----
 
@@ -198,6 +199,12 @@ export async function loadPrompts(): Promise<unknown[]> {
 
 export async function savePrompts(prompts: unknown[]): Promise<void> {
   return invoke("save_prompts", { prompts });
+}
+
+/** Load built-in prompt templates from the bundled app resource (read-only).
+ * Never touches user data — used by the "常用润色提示词" picker. */
+export async function loadBuiltinPrompts(): Promise<PromptItem[]> {
+  return invoke("load_builtin_prompts");
 }
 
 // ---- Sound ----

@@ -1,8 +1,9 @@
 import { Trash } from "lucide-react";
 import { useCallback, useEffect, useRef, useState } from "react";
-import { loadPrompts, savePrompts } from "@/settings/bridge";
+import { loadBuiltinPrompts, loadPrompts, savePrompts } from "@/settings/bridge";
 import { Button } from "@/settings/components/Button";
 import { Input } from "@/settings/components/Input";
+import { Modal } from "@/settings/components/Modal";
 import { Textarea } from "@/settings/components/Textarea";
 import {
   PageHeader,
@@ -13,7 +14,9 @@ import {
   SectionItem,
   SectionItemList,
 } from "@/settings/layout/PageLayout";
+import { cloneBuiltinPrompt } from "@/settings/lib/prompts";
 import { useSettings } from "@/settings/SettingsProvider";
+import type { PromptItem } from "@/settings/types/prompts";
 
 // Defaults MUST mirror Rust `get_provider_defaults` (src-tauri/src/llm.rs):
 // when a field is left empty the backend fills it from that table, so the
@@ -69,15 +72,6 @@ const LLM_PROVIDERS = [
   },
 ];
 
-interface PromptItem {
-  id: string;
-  title: string;
-  hotkey?: string[];
-  hotkey_mode?: string;
-  prompt?: string;
-  _displayString?: string;
-}
-
 let promptIdCounter = 1;
 function createPromptId(): string {
   return `p_${Date.now()}_${promptIdCounter++}`;
@@ -93,6 +87,7 @@ export function LLMPage() {
   const savedProviderCfg = (llm[providerKey] || {}) as Record<string, string>;
 
   const [prompts, setPrompts] = useState<PromptItem[]>([]);
+  const [builtinOpen, setBuiltinOpen] = useState(false);
   const promptsSaveChainRef = useRef<Promise<unknown>>(Promise.resolve());
 
   // Load prompts
@@ -126,6 +121,16 @@ export function LLMPage() {
     [scheduleSavePrompts],
   );
 
+  // Clone a built-in template (fresh id) into the user library.
+  const addClonedPrompt = useCallback(
+    (item: PromptItem) => {
+      const updated = [...prompts, cloneBuiltinPrompt(item)];
+      setPrompts(updated);
+      scheduleSavePrompts(updated);
+    },
+    [prompts, scheduleSavePrompts],
+  );
+
   // LLM provider switch: just flip the active provider. URL/model are shown
   // via per-provider defaults at render time, so switching needs no data
   // writes — and we must NOT copy the current provider's values into the
@@ -153,7 +158,10 @@ export function LLMPage() {
 
   return (
     <PageLayout>
-      <PageHeader title="文本润色" description="用于语音识别后的文本润色与文本结构化" />
+      <PageHeader
+        title="文本润色"
+        description="用于语音识别后的文本润色与文本结构化，触发请前往「快捷键」页面配置对应提示词的快捷键"
+      />
       {/* API Config */}
       <Section>
         <SectionHeader title="API 配置" />
@@ -216,31 +224,31 @@ export function LLMPage() {
 
       {/* Prompts */}
       <Section>
-        <SectionHeader
-          title="润色模板"
-          subtitle="编辑文本润色模板内容；模板快捷键在「快捷键」页面配置"
-          action={
-            <Button
-              variant="accent"
-              onClick={async () => {
-                const updated = [
-                  ...prompts,
-                  {
-                    id: createPromptId(),
-                    title: "新建模板",
-                    hotkey: [],
-                    hotkey_mode: "toggle",
-                    prompt: "",
-                  },
-                ];
-                setPrompts(updated);
-                await savePromptsNow(updated);
-              }}
-            >
-              + 添加模板
-            </Button>
-          }
-        />
+        <div className="flex justify-between items-center gap-2 px-4">
+          <Button
+            variant="accent"
+            onClick={async () => {
+              const updated = [
+                ...prompts,
+                {
+                  id: createPromptId(),
+                  title: "新建润色模板",
+                  hotkey: [],
+                  hotkey_mode: "toggle",
+                  prompt: "",
+                },
+              ];
+              setPrompts(updated);
+              await savePromptsNow(updated);
+            }}
+          >
+            + 添加模板
+          </Button>
+          <Button variant="default" onClick={() => setBuiltinOpen(true)}>
+            常用润色提示词
+          </Button>
+        </div>
+
         <SectionContent>
           <SectionItemList>
             {prompts.map((item, index) => (
@@ -292,6 +300,73 @@ export function LLMPage() {
           </SectionItemList>
         </SectionContent>
       </Section>
+      <BuiltinPromptsModal
+        open={builtinOpen}
+        onClose={() => setBuiltinOpen(false)}
+        onAdd={addClonedPrompt}
+      />
     </PageLayout>
+  );
+}
+
+interface BuiltinPromptsModalProps {
+  open: boolean;
+  onClose: () => void;
+  onAdd: (item: PromptItem) => void;
+}
+
+/**
+ * Picker for built-in prompt templates. Reads the bundled `prompts.json` from
+ * the app resource (never user data) via `loadBuiltinPrompts`, and lets the
+ * user clone any built-in template into a new custom template. The clone gets a
+ * fresh id so it is fully independent — editing/deleting it can never be
+ * re-merged from the built-in library on a future app update.
+ */
+function BuiltinPromptsModal({ open, onClose, onAdd }: BuiltinPromptsModalProps) {
+  const [items, setItems] = useState<PromptItem[]>([]);
+
+  useEffect(() => {
+    if (!open) return;
+    loadBuiltinPrompts()
+      .then(setItems)
+      .catch(() => setItems([]));
+  }, [open]);
+
+  return (
+    <Modal open={open} onClose={onClose} title="常用润色提示词">
+      <div className="space-y-3 overscroll-y-auto">
+        {items.length === 0 ? (
+          <p className="text-text-muted">暂无内置润色模板。</p>
+        ) : (
+          items.map((item) => {
+            const preview = item.prompt || "（无内容）";
+            return (
+              <Section key={item.id}>
+                <SectionHeader
+                  title={item.title || "未命名模板"}
+                  action={
+                    <Button
+                      variant="accent"
+                      onClick={() => {
+                        onAdd(cloneBuiltinPrompt(item));
+                        onClose();
+                      }}
+                    >
+                      添加
+                    </Button>
+                  }
+                />
+                <SectionContent>
+                  <p className="text-xs text-text-muted whitespace-pre-wrap">
+                    {preview.slice(0, 80)}
+                    {preview.length > 80 ? "…" : ""}
+                  </p>
+                </SectionContent>
+              </Section>
+            );
+          })
+        )}
+      </div>
+    </Modal>
   );
 }
