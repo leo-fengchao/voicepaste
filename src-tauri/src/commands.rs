@@ -3,14 +3,10 @@ use crate::app_state::HotkeyMode;
 use crate::config::{AsrDefaults, PromptItem};
 use crate::hotword::HotwordData;
 use crate::model;
-use crate::paste;
 use tauri::{utils::Theme, AppHandle, Emitter, Manager, State};
 
 #[cfg(target_os = "windows")]
 use std::os::windows::process::CommandExt;
-
-// Re-export paste::PasteResult for use in commands
-use paste::PasteResult;
 
 /// Cap on audio chunks buffered before the ASR session is ready (~100ms per
 /// chunk, so ~30s). Bounds memory if the connect keeps failing.
@@ -403,40 +399,6 @@ pub async fn send_diagnostic(
     let msg = serde_json::to_string(&payload).unwrap_or_default();
     log_app!(info, "Renderer diagnostic: {}", msg);
     Ok(())
-}
-
-/// Paste text to focused element. This writes to clipboard and simulates paste.
-#[tauri::command]
-pub async fn paste_text(
-    app: AppHandle,
-    text: String,
-    keep_clipboard: bool,
-) -> Result<PasteResult, String> {
-    // Write to clipboard using Tauri clipboard plugin
-    use tauri_plugin_clipboard_manager::ClipboardExt;
-
-    // Save original clipboard content if we need to restore it later
-    let original_clipboard: Option<String> = if !keep_clipboard {
-        app.clipboard().read_text().ok()
-    } else {
-        None
-    };
-
-    app.clipboard()
-        .write_text(&text)
-        .map_err(|e| format!("Failed to write to clipboard: {}", e))?;
-
-    // Simulate paste keystroke
-    let result = paste::simulate_paste();
-
-    // Restore previous clipboard if needed
-    if let Some(original) = original_clipboard {
-        app.clipboard()
-            .write_text(&original)
-            .map_err(|e| format!("Failed to restore clipboard: {}", e))?;
-    }
-
-    Ok(result)
 }
 
 /// Get microphone permission status via macOS AVFoundation.

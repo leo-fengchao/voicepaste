@@ -153,7 +153,6 @@ pub fn run() {
             commands::retry_history_transcription,
             commands::retry_latest_failed_transcription,
             commands::send_diagnostic,
-            commands::paste_text,
             commands::get_microphone_status,
             commands::request_microphone_access,
             commands::get_accessibility_status,
