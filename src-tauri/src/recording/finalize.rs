@@ -203,11 +203,17 @@ pub(super) async fn finalize_and_paste(
     // Write to clipboard
     use tauri_plugin_clipboard_manager::ClipboardExt;
 
-    // Save original clipboard content if we need to restore it later
+    // keep_clipboard (ON): leave the recognized text in the clipboard only,
+    // with NO auto-paste — the user pastes manually.
+    // !keep_clipboard (OFF, default): auto-paste the recognized text into the
+    // focused field, then restore whatever the clipboard held beforehand.
     let keep_clipboard = config
         .as_ref()
         .map(|c| c.app.keep_clipboard)
         .unwrap_or(true);
+
+    // Snapshot the clipboard before overwriting it so we can restore it after
+    // the paste. Only needed when we will actually paste.
     let original_clipboard: Option<String> = if !keep_clipboard {
         app_handle.clipboard().read_text().ok()
     } else {
@@ -224,13 +230,17 @@ pub(super) async fn finalize_and_paste(
         );
     }
 
-    // Simulate paste keystroke
-    let _result = crate::paste::simulate_paste();
+    // Auto-paste only when keep_clipboard is OFF. When ON, the recognized text
+    // stays in the clipboard for the user to paste manually.
+    if !keep_clipboard {
+        // Simulate paste keystroke
+        let _result = crate::paste::simulate_paste();
 
-    // Restore original clipboard content if keep_clipboard is disabled
-    if let Some(original) = original_clipboard {
-        if let Err(e) = app_handle.clipboard().write_text(&original) {
-            log_rec!(error, "Failed to restore clipboard: {}", e);
+        // Restore original clipboard content
+        if let Some(original) = original_clipboard {
+            if let Err(e) = app_handle.clipboard().write_text(&original) {
+                log_rec!(error, "Failed to restore clipboard: {}", e);
+            }
         }
     }
 
