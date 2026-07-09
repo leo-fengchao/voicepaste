@@ -1,10 +1,11 @@
-import { Copy, Play, RefreshCw, Trash2 } from "lucide-react";
+import { Copy, Play, RefreshCw, RotateCw, Trash2 } from "lucide-react";
 import { useCallback, useEffect, useState } from "react";
 import {
   deleteHistory,
   getHistory,
   getStats,
   playSoundFile,
+  regenerateHistoryTranscription,
   retryHistoryTranscription,
 } from "@/settings/bridge";
 import { Button } from "@/settings/components/Button";
@@ -70,6 +71,7 @@ export function HomePage() {
   const [history, setHistory] = useState<HistoryItem[]>([]);
   const [days, setDays] = useState(1);
   const [retryingTs, setRetryingTs] = useState<string | null>(null);
+  const [regeneratingTs, setRegeneratingTs] = useState<string | null>(null);
 
   const load = useCallback(async () => {
     try {
@@ -166,6 +168,7 @@ export function HomePage() {
                     const time = `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
                     const failed = item.status === "failed";
                     const retrying = retryingTs === item.ts;
+                    const regenerating = regeneratingTs === item.ts;
                     const displayText = failed
                       ? `转写失败：${item.error || item.text || "请检查网络连接"}`
                       : item.text;
@@ -193,7 +196,9 @@ export function HomePage() {
                           </div>
                           <div
                             className={`flex items-center gap-2 transition-opacity duration-200 absolute top-1/2 right-2 -translate-y-1/2 h-full ${
-                              retrying ? "opacity-100" : "opacity-0 group-hover:opacity-100"
+                              retrying || regenerating
+                                ? "opacity-100"
+                                : "opacity-0 group-hover:opacity-100"
                             }`}
                           >
                             {item.audioPath && (
@@ -248,19 +253,60 @@ export function HomePage() {
                                 <RefreshCw size={14} className={retrying ? "animate-spin" : ""} />
                               </Button>
                             ) : (
-                              <Button
-                                size="icon"
-                                variant="accent"
-                                onClick={async () => {
-                                  try {
-                                    await navigator.clipboard.writeText(item.text);
-                                  } catch {
-                                    /* */
-                                  }
-                                }}
-                              >
-                                <Copy size={14} />
-                              </Button>
+                              <>
+                                {/* Regenerate: only available when this session kept
+                                    its recording (keep-recording was on), so there is
+                                    audio to re-transcribe. Updates the record in place
+                                    without pasting. */}
+                                {item.audioPath && (
+                                  <Button
+                                    size="icon"
+                                    variant="accent"
+                                    title="重新生成"
+                                    disabled={regenerating}
+                                    onClick={async () => {
+                                      setRegeneratingTs(item.ts);
+                                      try {
+                                        const result = (await regenerateHistoryTranscription(
+                                          item.ts,
+                                        )) as { text?: string };
+                                        if (result.text) {
+                                          setHistory((prev) =>
+                                            prev.map((entry) =>
+                                              entry.ts === item.ts
+                                                ? { ...entry, text: result.text || "" }
+                                                : entry,
+                                            ),
+                                          );
+                                        }
+                                      } catch {
+                                        /* */
+                                      } finally {
+                                        setRegeneratingTs(null);
+                                      }
+                                    }}
+                                  >
+                                    <RotateCw
+                                      size={14}
+                                      className={regenerating ? "animate-spin" : ""}
+                                    />
+                                  </Button>
+                                )}
+                                <Button
+                                  size="icon"
+                                  variant="accent"
+                                  title="复制"
+                                  onClick={async () => {
+                                    try {
+                                      await navigator.clipboard.writeText(item.text);
+                                    } catch {
+                                      /* */
+                                    }
+                                  }}
+                                >
+                                  <Copy size={14} />
+                                </Button>
+                              </>
                             )}
                             <Button
                               size="icon"

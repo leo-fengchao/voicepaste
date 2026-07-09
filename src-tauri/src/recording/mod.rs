@@ -10,6 +10,7 @@ mod cue;
 mod finalize;
 mod history;
 mod lifecycle;
+mod regenerate;
 mod retry;
 mod session;
 mod wav;
@@ -22,6 +23,7 @@ use crate::app_state::{self, ActivePromptId, RecordingState};
 use crate::hotkey;
 
 pub(crate) use capture::NativeAudioCapture;
+pub(crate) use regenerate::regenerate_history_transcription;
 pub(crate) use retry::{retry_history_transcription, retry_latest_failed_transcription};
 
 /// Begin a neutral recording triggered by the hotkey matcher — the prompt is
