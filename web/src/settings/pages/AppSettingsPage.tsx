@@ -174,7 +174,7 @@ export function AppSettingsPage() {
             />
             <SectionItem
               title="保留剪贴板"
-              description="开启后语音识别内容仅保留在剪贴板；关闭后自动输入到光标处"
+              description="粘贴后保留识别文字在剪贴板；关闭则恢复原剪贴板内容"
               action={
                 <Toggle
                   checked={app.keep_clipboard !== false}
