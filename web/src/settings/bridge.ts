@@ -191,6 +191,10 @@ export async function retryHistoryTranscription(ts: string): Promise<unknown> {
   return invoke("retry_history_transcription", { ts });
 }
 
+export async function regenerateHistoryTranscription(ts: string): Promise<unknown> {
+  return invoke("regenerate_history_transcription", { ts });
+}
+
 // ---- Prompts ----
 
 export async function loadPrompts(): Promise<unknown[]> {

@@ -161,6 +161,59 @@ impl StatsService {
         true
     }
 
+    /// Rewrite an existing successful entry's text in place, preserving its
+    /// timestamp, status, and saved audio. Used when the user regenerates a kept
+    /// recording whose original transcription lost content. Aggregate usage
+    /// counters are left untouched — this replaces text rather than adding a new
+    /// session. Returns `true` when a matching entry was found and rewritten.
+    pub fn update_history_text(&mut self, ts: &str, text: &str) -> bool {
+        if text.is_empty() {
+            return false;
+        }
+
+        let Ok(d) = chrono::DateTime::parse_from_rfc3339(ts) else {
+            return false;
+        };
+        let local = d.with_timezone(&Local);
+        let key = local.format("%Y-%m-%d").to_string();
+        let file_path = self.history_dir.join(format!("{}.jsonl", key));
+        let Ok(content) = fs::read_to_string(&file_path) else {
+            return false;
+        };
+
+        let mut replaced = false;
+        let char_count = text.len();
+        let mut next_lines = Vec::new();
+        for line in content.lines().filter(|line| !line.is_empty()) {
+            match serde_json::from_str::<HistoryEntry>(line) {
+                Ok(mut entry) if entry.ts == ts => {
+                    entry.text = text.to_string();
+                    entry.chars = char_count;
+                    if let Ok(json) = serde_json::to_string(&entry) {
+                        next_lines.push(json);
+                        replaced = true;
+                    } else {
+                        next_lines.push(line.to_string());
+                    }
+                }
+                Ok(entry) => {
+                    if let Ok(json) = serde_json::to_string(&entry) {
+                        next_lines.push(json);
+                    } else {
+                        next_lines.push(line.to_string());
+                    }
+                }
+                Err(_) => next_lines.push(line.to_string()),
+            }
+        }
+
+        if !replaced {
+            return false;
+        }
+
+        fs::write(&file_path, format!("{}\n", next_lines.join("\n"))).is_ok()
+    }
+
     pub fn record_failure(
         &mut self,
         message: &str,
@@ -533,6 +586,38 @@ mod tests {
         assert!(history[0].audio_path.is_none());
         assert!(history[0].error.is_none());
         assert_eq!(svc.get_stats().total_sessions, 1);
+    }
+
+    #[test]
+    fn update_history_text_rewrites_entry_in_place() {
+        let (mut svc, _dir) = new_stats_service();
+        svc.record_session_with_audio("old text", Some("/tmp/kept.wav".to_string()), None);
+        let ts = svc.get_history(365)[0].ts.clone();
+        let sessions_before = svc.get_stats().total_sessions;
+
+        assert!(svc.update_history_text(&ts, "regenerated text"));
+
+        let history = svc.get_history(365);
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].ts, ts);
+        assert_eq!(history[0].text, "regenerated text");
+        assert_eq!(history[0].chars, "regenerated text".len());
+        assert_eq!(history[0].status, "success");
+        // Audio is preserved so the entry can be regenerated again.
+        assert_eq!(history[0].audio_path.as_deref(), Some("/tmp/kept.wav"));
+        // Regeneration replaces text; it must not count as a new session.
+        assert_eq!(svc.get_stats().total_sessions, sessions_before);
+    }
+
+    #[test]
+    fn update_history_text_missing_entry_returns_false() {
+        let (mut svc, _dir) = new_stats_service();
+        svc.record_session_with_audio("only entry", None, None);
+        let ts = svc.get_history(365)[0].ts.clone();
+        // A timestamp on the same day but not matching any entry.
+        let other_ts = format!("{}9", &ts[..ts.len() - 1]);
+        assert!(!svc.update_history_text(&other_ts, "nope"));
+        assert!(!svc.update_history_text(&ts, ""));
     }
 
     #[test]

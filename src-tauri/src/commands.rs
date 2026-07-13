@@ -299,6 +299,17 @@ pub async fn retry_latest_failed_transcription(
     crate::recording::retry_latest_failed_transcription(app).await
 }
 
+/// Regenerate a successful history entry by re-transcribing its kept recording,
+/// rewriting the entry's text in place. Silent: no overlay, paste, or app-state
+/// change. Requires the entry to have a saved recording (keep-recording on).
+#[tauri::command]
+pub async fn regenerate_history_transcription(
+    app: AppHandle,
+    ts: String,
+) -> Result<serde_json::Value, String> {
+    crate::recording::regenerate_history_transcription(app, ts).await
+}
+
 /// Compute a 0..1 loudness level from f32 PCM samples for the overlay waveform
 /// (RMS + peak, mild compression). Every platform consumes this via the unified
 /// `audio:level` overlay event.

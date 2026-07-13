@@ -152,6 +152,7 @@ pub fn run() {
             commands::delete_history,
             commands::retry_history_transcription,
             commands::retry_latest_failed_transcription,
+            commands::regenerate_history_transcription,
             commands::send_diagnostic,
             commands::get_microphone_status,
             commands::request_microphone_access,
