@@ -1,7 +1,6 @@
 import { useCallback, useEffect, useState } from "react";
-import type { HotkeyRecordResult } from "@/settings/bridge";
-import { loadPrompts, recordHotkey, savePrompts } from "@/settings/bridge";
-import { Button } from "@/settings/components/Button";
+import { loadPrompts, savePrompts } from "@/settings/bridge";
+import { HotkeyInput } from "@/settings/components/HotkeyInput";
 import { KeyCap } from "@/settings/components/KeyCap";
 import { SegmentedControl } from "@/settings/components/SegmentedControl";
 import {
@@ -9,30 +8,33 @@ import {
   PageLayout,
   Section,
   SectionContent,
+  SectionHeader,
   SectionItem,
   SectionItemList,
 } from "@/settings/layout/PageLayout";
-import { formatPromptHotkey, normalizeHotkeyToken } from "@/settings/lib/hotkey";
+import { normalizeHotkeyToken } from "@/settings/lib/hotkey";
 import { useSettings } from "@/settings/SettingsProvider";
 import type { PromptItem } from "@/settings/types/prompts";
+
+const MODE_OPTIONS = [
+  { value: "toggle", label: "免提模式" },
+  { value: "hold", label: "按住说话" },
+];
 
 export function HotkeyPage() {
   const { settings, scheduleSave } = useSettings();
   const cfg = settings?.parsedConfig || ({} as Record<string, unknown>);
   const app = (cfg.app || {}) as Record<string, string | undefined>;
-  const hotkeyStr = app.hotkey || "F13";
+  // Keep an explicit empty string (user cleared the key) distinct from missing.
+  const hotkeyStr = app.hotkey ?? "F13";
   const hotkeyMode = (app.hotkey_mode as string) || "toggle";
   // Show Apple symbols on macOS, native labels (Ctrl/Alt/Win/Shift) on Windows.
   const isMac = settings?.runtime?.platform === "macos";
 
-  const [recording, setRecording] = useState(false);
   const [prompts, setPrompts] = useState<PromptItem[]>([]);
-  const [recordingIdx, setRecordingIdx] = useState<number | null>(null);
-
-  // Any recording in progress (main or prompt) disables all record buttons —
-  // the backend keytap recorder handles one combination at a time, so letting
-  // a second recording start would race with the in-flight one.
-  const anyRecording = recording || recordingIdx !== null;
+  // Which field is currently capturing — only one recorder runs at a time, so
+  // every other recordable field goes `busy` while it is set.
+  const [activeRecorder, setActiveRecorder] = useState<string | null>(null);
 
   useEffect(() => {
     loadPrompts()
@@ -42,70 +44,100 @@ export function HotkeyPage() {
       .catch(() => {});
   }, []);
 
-  const startRecord = useCallback(async () => {
-    setRecording(true);
-    const result: HotkeyRecordResult = await recordHotkey();
-    setRecording(false);
-    if (result.keys.length > 0) {
-      scheduleSave({ app: { hotkey: result.keys[0] } });
-    }
-  }, [scheduleSave]);
+  const isBusyFor = useCallback(
+    (id: string) => activeRecorder !== null && activeRecorder !== id,
+    [activeRecorder],
+  );
 
-  const recordPromptHotkey = useCallback(
-    async (index: number) => {
-      if (recordingIdx !== null) return;
-      setRecordingIdx(index);
-      const result: HotkeyRecordResult = await recordHotkey();
-      setRecordingIdx(null);
-      const updated = [...prompts];
-      if (result.hotkey) {
-        updated[index] = {
-          ...updated[index],
-          hotkey: result.hotkey,
-          _displayString: result.displayString,
-        };
-      } else {
-        updated[index] = { ...updated[index], hotkey: "" };
-        delete updated[index]._displayString;
-      }
+  // Immutable update of a single prompt + persist. Shared by mode switches and
+  // record/clear of the prompt's own hotkey.
+  const updatePrompt = useCallback(
+    async (index: number, patch: Partial<PromptItem>) => {
+      const updated = prompts.map((p, i) => (i === index ? { ...p, ...patch } : p));
       setPrompts(updated);
       await savePrompts(updated as unknown[]);
     },
-    [prompts, recordingIdx],
+    [prompts],
+  );
+
+  // The recordable hotkey field for one prompt row — its "stop" key in toggle
+  // mode, its single key in hold mode. The "start" side is rendered separately
+  // as the locked global main key.
+  const promptRecorderProps = useCallback(
+    (item: PromptItem, index: number) => {
+      const recorderId = `prompt:${item.id}`;
+      return {
+        isMac,
+        busy: isBusyFor(recorderId),
+        onStart: () => setActiveRecorder(recorderId),
+        onDone: () => setActiveRecorder(null),
+        onCommit: (hk: string) => updatePrompt(index, { hotkey: hk }),
+        onClear: () => updatePrompt(index, { hotkey: "" }),
+      };
+    },
+    [isMac, isBusyFor, updatePrompt],
   );
 
   return (
     <PageLayout>
       <PageHeader title="快捷键" description="为语音输入配置自定义快捷键。">
-        <div className="space-y-2 text-xs text-text-muted py-2">
+        <div className="flex flex-col gap-1 mt-2 text-text-muted">
+          <p>免提模式：按一次「语音唤起」开始，再按一次结束，或按润色快捷键在结束时润色；</p>
+          <p>按住说话：按住对应快捷键开始，松开结束。</p>
           <p>
-            点击切换：按一次开始，按一次结束，
-            <KeyCap label={normalizeHotkeyToken("ESC", isMac).main} /> 取消
+            录制快捷键时按 <KeyCap label={normalizeHotkeyToken("ESC", isMac).main} /> 取消
           </p>
-          <p>按住说话：按住开始，松开结束</p>
         </div>
       </PageHeader>
+
+      {/* Section 1 — global main key (the hands-free wake key) */}
       <Section>
+        <SectionHeader
+          title="全局语音主键"
+          subtitle="免提模式的唤起键 / 按住说话键；所有免提模式均以此键开始录音"
+        />
         <SectionContent>
           <SectionItemList>
             <SectionItem
-              title="快捷键 - 默认"
+              title="语音唤起"
+              last
+              action={
+                <HotkeyInput
+                  value={hotkeyStr}
+                  isMac={isMac}
+                  busy={isBusyFor("main")}
+                  onStart={() => setActiveRecorder("main")}
+                  onDone={() => setActiveRecorder(null)}
+                  onCommit={(hk) => scheduleSave({ app: { hotkey: hk } })}
+                  onClear={() => scheduleSave({ app: { hotkey: "" } })}
+                />
+              }
+            />
+          </SectionItemList>
+        </SectionContent>
+      </Section>
+
+      {/* Section 2 — per-feature hotkeys (voice input + each polish prompt) */}
+      <Section>
+        <SectionHeader title="快捷键" subtitle="点击输入框进入录制 → 按下快捷键" />
+        <SectionContent>
+          <SectionItemList>
+            <SectionItem
+              title="语音输入"
               action={
                 <div className="flex items-center gap-2">
-                  <div className="flex items-center gap-1 flex-wrap border border-border px-2 py-1 rounded-md h-full">
-                    {hotkeyStr.split("+").map((k) => {
-                      const token = normalizeHotkeyToken(k, isMac);
-                      return <KeyCap key={k} label={token.main} side={token.side} />;
-                    })}
-                  </div>
-                  <Button variant="accent" onClick={startRecord} disabled={anyRecording}>
-                    {recording ? "请按键…" : "录制"}
-                  </Button>
+                  {hotkeyMode === "toggle" ? (
+                    <>
+                      {/* start = main key (locked); stop = press main key again (locked) */}
+                      <HotkeyInput value={hotkeyStr} isMac={isMac} locked />
+                      <span className="text-xs text-text-muted">→</span>
+                      <HotkeyInput value={hotkeyStr} isMac={isMac} locked />
+                    </>
+                  ) : (
+                    <HotkeyInput value={hotkeyStr} isMac={isMac} locked />
+                  )}
                   <SegmentedControl
-                    options={[
-                      { value: "toggle", label: "点击切换" },
-                      { value: "hold", label: "按住说话" },
-                    ]}
+                    options={MODE_OPTIONS}
                     value={hotkeyMode}
                     onChange={(v) => scheduleSave({ app: { hotkey_mode: v } })}
                   />
@@ -113,50 +145,41 @@ export function HotkeyPage() {
               }
             />
 
-            {/* Prompt hotkeys */}
-            {prompts.map((item, idx) => (
-              <SectionItem
-                key={item.id}
-                title={`快捷键 - ${item.title || "未命名模板"}`}
-                last={idx === prompts.length - 1}
-                action={
-                  <div className="flex items-center gap-2">
-                    <div className="flex items-center gap-1 flex-wrap border border-border px-2 py-1 rounded-md h-full">
-                      {item._displayString || formatPromptHotkey(item.hotkey) ? (
-                        (item._displayString || formatPromptHotkey(item.hotkey))
-                          .split("+")
-                          .map((k) => {
-                            const token = normalizeHotkeyToken(k, isMac);
-                            return <KeyCap key={k} label={token.main} side={token.side} />;
-                          })
+            {prompts.map((item, idx) => {
+              const mode = item.hotkey_mode || "toggle";
+              return (
+                <SectionItem
+                  key={item.id}
+                  title={item.title}
+                  last={idx === prompts.length - 1}
+                  action={
+                    <div className="flex items-center gap-2">
+                      {mode === "toggle" ? (
+                        <>
+                          {/* start = main key (locked); stop = this prompt's polish key */}
+                          <HotkeyInput value={hotkeyStr} isMac={isMac} locked />
+                          <span className="text-xs text-text-muted">→</span>
+                          <HotkeyInput
+                            value={item.hotkey || ""}
+                            {...promptRecorderProps(item, idx)}
+                          />
+                        </>
                       ) : (
-                        <span className="text-xs text-text-muted">未绑定</span>
+                        <HotkeyInput
+                          value={item.hotkey || ""}
+                          {...promptRecorderProps(item, idx)}
+                        />
                       )}
+                      <SegmentedControl
+                        options={MODE_OPTIONS}
+                        value={mode}
+                        onChange={(v) => updatePrompt(idx, { hotkey_mode: v })}
+                      />
                     </div>
-                    <Button
-                      variant="accent"
-                      disabled={anyRecording}
-                      onClick={() => recordPromptHotkey(idx)}
-                    >
-                      {recordingIdx === idx ? "录制中…" : "录制"}
-                    </Button>
-                    <SegmentedControl
-                      options={[
-                        { value: "toggle", label: "点击切换" },
-                        { value: "hold", label: "按住说话" },
-                      ]}
-                      value={item.hotkey_mode || "toggle"}
-                      onChange={async (v) => {
-                        const updated = [...prompts];
-                        updated[idx] = { ...updated[idx], hotkey_mode: v };
-                        setPrompts(updated);
-                        await savePrompts(updated as unknown[]);
-                      }}
-                    />
-                  </div>
-                }
-              />
-            ))}
+                  }
+                />
+              );
+            })}
           </SectionItemList>
         </SectionContent>
       </Section>

@@ -26,8 +26,10 @@ pub enum HotkeyAction {
 /// - A **hold** chord starts recording the instant its keys are all pressed
 ///   (keydown) — zero latency, prompt undecided.
 /// - A **toggle** chord starts/stops on completion of a press cycle (the held
-///   set empties at keyup); the prompt is the longest chord reached in that
-///   stop cycle.
+///   set empties at keyup). Only the **main** toggle chord (prompt_id `None`)
+///   wakes recording; toggle prompt chords are stop-only — they finalize and
+///   polish when pressed during a recording. The prompt is the longest chord
+///   reached in that stop cycle.
 /// - Recording always starts *neutral*; the prompt is fixed only when it ends,
 ///   from the longest chord held during the hold (peak) or the stop cycle.
 ///   The chord is fully known at that point, so prefix conflicts like `Ctrl`
@@ -123,14 +125,18 @@ impl MatcherState {
                     }
                     None => {
                         if self.held.is_empty() {
-                            // Start cycle: begin only if it reached a toggle chord.
-                            if let Some(i) = self
+                            // Start cycle: in hands-free (toggle) mode only the main
+                            // hotkey (prompt_id None) wakes recording; toggle prompt
+                            // chords are stop-only — they finalize + polish once a
+                            // recording is already running.
+                            if self
                                 .cycle_best
                                 .filter(|&i| bindings[i].mode == HotkeyMode::Toggle)
+                                .filter(|&i| bindings[i].prompt_id.is_none())
+                                .is_some()
                             {
-                                let is_main = bindings[i].prompt_id.is_none();
                                 self.recording = Some(HotkeyMode::Toggle);
-                                actions.push(HotkeyAction::StartRecording { is_main });
+                                actions.push(HotkeyAction::StartRecording { is_main: true });
                             }
                             self.cycle_best = None;
                         }
@@ -301,9 +307,46 @@ mod tests {
     }
 
     #[test]
-    fn toggle_start_long_stop_short_follows_stop_cycle() {
+    fn toggle_main_only_wakes_prompt_chord_is_stop_only() {
         let bindings = [
             binding(&[Key::ControlLeft], "toggle", None),
+            binding(
+                &[Key::ControlLeft, Key::ShiftLeft],
+                "toggle",
+                Some("polish"),
+            ),
+        ];
+        // Hands-free wake is main-only: pressing the longer prompt chord
+        // (Ctrl+Shift) while idle does NOT start. The main chord (Ctrl) then
+        // wakes, and pressing it again stops raw.
+        let actions = run_matcher(
+            &bindings,
+            &[
+                down(Key::ControlLeft),
+                down(Key::ShiftLeft),
+                up(Key::ShiftLeft),
+                up(Key::ControlLeft),
+                down(Key::ControlLeft),
+                up(Key::ControlLeft),
+                down(Key::ControlLeft),
+                up(Key::ControlLeft),
+            ],
+        );
+        assert_eq!(
+            actions,
+            vec![
+                HotkeyAction::StartRecording { is_main: true },
+                HotkeyAction::StopRecording { prompt_id: None },
+            ]
+        );
+    }
+
+    #[test]
+    fn toggle_prompt_chord_does_not_start_when_idle() {
+        // A toggle prompt chord pressed while idle must never wake recording —
+        // only the main hotkey does. The prompt chord only acts on stop.
+        let bindings = [
+            binding(&[Key::F13], "toggle", None),
             binding(
                 &[Key::ControlLeft, Key::ShiftLeft],
                 "toggle",
@@ -317,16 +360,13 @@ mod tests {
                 down(Key::ShiftLeft),
                 up(Key::ShiftLeft),
                 up(Key::ControlLeft),
-                down(Key::ControlLeft),
-                up(Key::ControlLeft),
+                down(Key::F13),
+                up(Key::F13),
             ],
         );
         assert_eq!(
             actions,
-            vec![
-                HotkeyAction::StartRecording { is_main: false },
-                HotkeyAction::StopRecording { prompt_id: None },
-            ]
+            vec![HotkeyAction::StartRecording { is_main: true }]
         );
     }
 
