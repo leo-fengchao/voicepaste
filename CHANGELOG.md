@@ -1,5 +1,18 @@
 # Changelog
 
+## v2.1.3 (2026-07-13)
+
+### New Features
+
+- **Hotkey Settings Redesign** — Click the input to record (no more per-row record buttons); the page splits into the global main key and per-feature hotkeys. In hands-free mode the start key is fixed to the global main key, with a separate stop key.
+- **Re-transcribe from History** — Entries that kept their recording can be re-transcribed from the saved audio without re-recording.
+- **Decoupled Built-in Libraries** — Built-in prompt templates and hotword tables no longer re-merge on startup, so deletions stick; add them on demand via the "常用…" pickers.
+
+### Under the Hood
+
+- Unified prompt hotkey storage as a `+`-joined string; legacy array form auto-migrated.
+- Removed the unused `paste_text` command.
+
 ## v2.1.2 (2026-07-02)
 
 Hotfix release focused on Windows hotkey recording reliability.
