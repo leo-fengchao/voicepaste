@@ -142,6 +142,12 @@ extern "C" fn retry_clicked(_this: *mut AnyObject, _sel: Sel, _sender: *mut AnyO
         return;
     };
     tauri::async_runtime::spawn(async move {
+        // The same button serves both retryable failures. A parked polish takes
+        // precedence: its text is still unpasted, so retrying it is what the
+        // ring is counting down against.
+        if crate::recording::retry_pending_polish(app.clone()).await {
+            return;
+        }
         let _ = crate::recording::retry_latest_failed_transcription(app).await;
     });
 }

@@ -10,6 +10,7 @@ mod cue;
 mod finalize;
 mod history;
 mod lifecycle;
+mod polish;
 mod regenerate;
 mod retry;
 mod session;
@@ -23,6 +24,7 @@ use crate::app_state::{self, ActivePromptId, RecordingState};
 use crate::hotkey;
 
 pub(crate) use capture::NativeAudioCapture;
+pub(crate) use polish::{repolish_history_entry, retry_pending_polish};
 pub(crate) use regenerate::regenerate_history_transcription;
 pub(crate) use retry::{retry_history_transcription, retry_latest_failed_transcription};
 
@@ -32,8 +34,17 @@ pub(crate) use retry::{retry_history_transcription, retry_latest_failed_transcri
 pub(crate) async fn on_recording_start(app_handle: AppHandle, is_main: bool) {
     if is_main {
         let app_inner = app_handle.state::<Arc<app_state::AppInner>>();
-        let can_retry = matches!(*app_inner.state.lock().await, app_state::AppState::Idle)
-            && app_inner.current_failure_ts.lock().await.is_some();
+        let idle = matches!(*app_inner.state.lock().await, app_state::AppState::Idle);
+
+        // A failed polish is waiting on a decision: the main hotkey retries the
+        // polish rather than starting a new recording.
+        if idle && polish::has_pending_polish(&app_inner).await {
+            polish::retry_pending_polish(app_handle.clone()).await;
+            reset_matcher_recording(&app_handle);
+            return;
+        }
+
+        let can_retry = idle && app_inner.current_failure_ts.lock().await.is_some();
         if can_retry {
             let _ = retry::retry_latest_failed_transcription(app_handle.clone()).await;
             // Retry did not start a recording — resync the matcher so it does
@@ -70,6 +81,15 @@ pub(crate) async fn on_escape(app_handle: AppHandle) {
         return;
     }
     let app_inner = app_handle.state::<Arc<app_state::AppInner>>();
+
+    // A failed polish is waiting on a decision: ESC gives up on polishing and
+    // pastes the recognized text as-is rather than discarding it.
+    if polish::has_pending_polish(&app_inner).await {
+        let app_inner = Arc::clone(&app_inner);
+        polish::deliver_raw(&app_handle, &app_inner, "dismissed with ESC").await;
+        return;
+    }
+
     let state = app_inner.state.lock().await.clone();
     match state {
         // Retry in progress (a normal commit has no retry marker): abort it.

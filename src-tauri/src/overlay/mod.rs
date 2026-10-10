@@ -185,8 +185,9 @@ pub(crate) fn schedule_retry_overlay_hide(
 }
 
 /// Directly toggle the ESC-cancel shortcut, independent of the recording state
-/// machine. Used to keep ESC live while a retryable failure is shown (idle).
-fn set_escape_enabled_now(app: &AppHandle, enabled: bool) {
+/// machine. Used to keep ESC live while a retryable failure or a deferred
+/// polish decision is shown (idle).
+pub(crate) fn set_escape_enabled_now(app: &AppHandle, enabled: bool) {
     if let Some(hc) = app.try_state::<hotkey::HotkeyConfig>() {
         hotkey::set_escape_enabled(&hc, enabled);
     }

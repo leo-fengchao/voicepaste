@@ -147,3 +147,19 @@ main {
   scrollbar-gutter: stable; /* 保留空间，内容不会左右跳动 */
   scrollbar-width: thin; /* 标准属性控制宽度 */
 }
+
+/* Toast: rises into place, then holds. Paired with the auto-dismiss timer in
+   `components/Toast.tsx`, which unmounts it. */
+@keyframes toast-in {
+  from {
+    opacity: 0;
+    transform: translateY(6px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+.animate-toast-in {
+  animation: toast-in 160ms ease-out;
+}

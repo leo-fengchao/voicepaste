@@ -1,15 +1,21 @@
-import { Copy, Play, RefreshCw, RotateCw, Trash2 } from "lucide-react";
+import { Copy, Loader2, Pause, Play, RefreshCw, RotateCw, Sparkles, Trash2 } from "lucide-react";
 import { useCallback, useEffect, useState } from "react";
 import {
   deleteHistory,
   getHistory,
   getStats,
-  playSoundFile,
+  loadPrompts,
+  onPreviewEnded,
+  playRecordingPreview,
   regenerateHistoryTranscription,
+  repolishHistoryEntry,
   retryHistoryTranscription,
+  stopRecordingPreview,
 } from "@/settings/bridge";
 import { Button } from "@/settings/components/Button";
 import { Heatmap } from "@/settings/components/Heatmap";
+import { PromptMenu } from "@/settings/components/PromptMenu";
+import { Toast, useToast } from "@/settings/components/Toast";
 import {
   PageHeader,
   PageLayout,
@@ -19,6 +25,7 @@ import {
   SectionItemList,
 } from "@/settings/layout/PageLayout";
 import { formatCompact } from "@/settings/lib/format";
+import type { PromptItem } from "@/settings/types/prompts";
 
 /* ---------- pure helpers ---------- */
 
@@ -62,6 +69,8 @@ interface HistoryItem {
   audioPath?: string;
   error?: string;
   retryOf?: string;
+  /** Prompt template this entry was polished with; absent when never polished. */
+  promptId?: string;
 }
 
 /* ---------- component ---------- */
@@ -72,6 +81,23 @@ export function HomePage() {
   const [days, setDays] = useState(1);
   const [retryingTs, setRetryingTs] = useState<string | null>(null);
   const [regeneratingTs, setRegeneratingTs] = useState<string | null>(null);
+  const [repolishingTs, setRepolishingTs] = useState<string | null>(null);
+  // The entry whose recording is playing. Only one plays at a time, so this
+  // doubles as the play/pause state for every row's button.
+  const [playingTs, setPlayingTs] = useState<string | null>(null);
+  const { toast, showToast } = useToast();
+  // Why the last re-polish failed, keyed by entry. Shown inline under the row:
+  // the message names what to fix (model, key, quota), so it has to be readable
+  // rather than a transient toast.
+  const [repolishErrors, setRepolishErrors] = useState<Record<string, string>>({});
+  // Template picker for polishing: which row it is open on, and its button.
+  const [polishMenu, setPolishMenu] = useState<{ ts: string; anchor: HTMLElement } | null>(null);
+  const [prompts, setPrompts] = useState<PromptItem[]>([]);
+  const closePolishMenu = useCallback(() => setPolishMenu(null), []);
+
+  // Playback ends on its own, or because another row replaced it; either way the
+  // backend reports it, so the button never stays stuck on pause.
+  useEffect(() => onPreviewEnded(() => setPlayingTs(null)), []);
 
   const load = useCallback(async () => {
     try {
@@ -93,6 +119,43 @@ export function HomePage() {
     load();
     loadHist(1);
   }, [load, loadHist]);
+
+  // Reloaded each time the picker opens so templates edited on the LLM page show up.
+  const openPolishMenu = useCallback(async (ts: string, anchor: HTMLElement) => {
+    try {
+      setPrompts(((await loadPrompts()) || []) as PromptItem[]);
+    } catch {
+      setPrompts([]);
+    }
+    setPolishMenu({ ts, anchor });
+  }, []);
+
+  const repolish = useCallback(
+    async (ts: string, promptId: string) => {
+      setPolishMenu(null);
+      setRepolishingTs(ts);
+      setRepolishErrors((prev) => {
+        const { [ts]: _dropped, ...rest } = prev;
+        return rest;
+      });
+      try {
+        const result = (await repolishHistoryEntry(ts, promptId)) as { text?: string };
+        if (result.text) {
+          const text = result.text;
+          setHistory((prev) =>
+            prev.map((entry) => (entry.ts === ts ? { ...entry, text, promptId } : entry)),
+          );
+        }
+        showToast("润色完成");
+      } catch (error) {
+        setRepolishErrors((prev) => ({ ...prev, [ts]: String(error) }));
+        showToast("润色失败", "error");
+      } finally {
+        setRepolishingTs(null);
+      }
+    },
+    [showToast],
+  );
 
   /* —— achievements —— */
   const charTotal = stats?.totalCharacters || 0;
@@ -169,6 +232,10 @@ export function HomePage() {
                     const failed = item.status === "failed";
                     const retrying = retryingTs === item.ts;
                     const regenerating = regeneratingTs === item.ts;
+                    const repolishing = repolishingTs === item.ts;
+                    const repolishError = repolishErrors[item.ts];
+                    const menuOpen = polishMenu?.ts === item.ts;
+                    const playing = playingTs === item.ts;
                     const displayText = failed
                       ? `转写失败：${item.error || item.text || "请检查网络连接"}`
                       : item.text;
@@ -192,11 +259,16 @@ export function HomePage() {
                               >
                                 {displayText}
                               </p>
+                              {repolishError && (
+                                <p className="pb-1 text-xs leading-[1.4] text-warning">
+                                  润色失败：{repolishError}
+                                </p>
+                              )}
                             </div>
                           </div>
                           <div
                             className={`flex items-center gap-2 transition-opacity duration-200 absolute top-1/2 right-2 -translate-y-1/2 h-full ${
-                              retrying || regenerating
+                              retrying || regenerating || repolishing || menuOpen
                                 ? "opacity-100"
                                 : "opacity-0 group-hover:opacity-100"
                             }`}
@@ -205,15 +277,24 @@ export function HomePage() {
                               <Button
                                 size="icon"
                                 variant="accent"
+                                title={playing ? "暂停" : "播放"}
                                 onClick={async () => {
                                   try {
-                                    await playSoundFile(item.audioPath || "");
+                                    if (playing) {
+                                      await stopRecordingPreview();
+                                      setPlayingTs(null);
+                                      return;
+                                    }
+                                    // Starting a preview stops whatever else was
+                                    // playing, so claim the state right away.
+                                    setPlayingTs(item.ts);
+                                    await playRecordingPreview(item.audioPath || "");
                                   } catch {
-                                    /* */
+                                    setPlayingTs(null);
                                   }
                                 }}
                               >
-                                <Play size={14} />
+                                {playing ? <Pause size={14} /> : <Play size={14} />}
                               </Button>
                             )}
                             {failed ? (
@@ -243,8 +324,9 @@ export function HomePage() {
                                       );
                                     }
                                     await load();
-                                  } catch {
-                                    /* */
+                                    showToast("重新转写完成");
+                                  } catch (error) {
+                                    showToast(`重新转写失败：${error}`, "error");
                                   } finally {
                                     setRetryingTs(null);
                                   }
@@ -279,8 +361,9 @@ export function HomePage() {
                                             ),
                                           );
                                         }
-                                      } catch {
-                                        /* */
+                                        showToast("重新生成完成");
+                                      } catch (error) {
+                                        showToast(`重新生成失败：${error}`, "error");
                                       } finally {
                                         setRegeneratingTs(null);
                                       }
@@ -292,6 +375,38 @@ export function HomePage() {
                                     />
                                   </Button>
                                 )}
+                                {/* Polish: on every successful entry, so text
+                                    delivered without polishing (or polished
+                                    badly) gets a second chance. Opens a template
+                                    picker; rewrites the record in place. */}
+                                <Button
+                                  size="icon"
+                                  variant="accent"
+                                  title={item.promptId ? "重新润色" : "润色"}
+                                  disabled={repolishing}
+                                  onClick={(event) => {
+                                    if (menuOpen) {
+                                      setPolishMenu(null);
+                                      return;
+                                    }
+                                    openPolishMenu(item.ts, event.currentTarget);
+                                  }}
+                                >
+                                  {repolishing ? (
+                                    <Loader2 size={14} className="animate-spin" />
+                                  ) : (
+                                    <Sparkles size={14} />
+                                  )}
+                                </Button>
+                                {menuOpen && polishMenu && (
+                                  <PromptMenu
+                                    anchor={polishMenu.anchor}
+                                    prompts={prompts}
+                                    currentId={item.promptId}
+                                    onSelect={(prompt) => repolish(item.ts, prompt.id)}
+                                    onClose={closePolishMenu}
+                                  />
+                                )}
                                 <Button
                                   size="icon"
                                   variant="accent"
@@ -299,8 +414,9 @@ export function HomePage() {
                                   onClick={async () => {
                                     try {
                                       await navigator.clipboard.writeText(item.text);
+                                      showToast("已复制");
                                     } catch {
-                                      /* */
+                                      showToast("复制失败", "error");
                                     }
                                   }}
                                 >
@@ -311,12 +427,14 @@ export function HomePage() {
                             <Button
                               size="icon"
                               variant="accent"
+                              title="删除"
                               onClick={async () => {
                                 try {
                                   await deleteHistory(item.ts);
                                   setHistory((p) => p.filter((h) => h.ts !== item.ts));
+                                  showToast("已删除");
                                 } catch {
-                                  /* */
+                                  showToast("删除失败", "error");
                                 }
                               }}
                             >
@@ -344,6 +462,7 @@ export function HomePage() {
           </SectionItemList>
         </SectionContent>
       </Section>
+      <Toast toast={toast} />
     </PageLayout>
   );
 }

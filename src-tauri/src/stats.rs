@@ -32,6 +32,24 @@ pub struct HistoryEntry {
     pub error: Option<String>,
     #[serde(rename = "retryOf", default, skip_serializing_if = "Option::is_none")]
     pub retry_of: Option<String>,
+    /// Prompt template this session was polished with, when a prompt hotkey drove
+    /// it. Its presence is what makes an entry re-polishable from the history list.
+    #[serde(rename = "promptId", default, skip_serializing_if = "Option::is_none")]
+    pub prompt_id: Option<String>,
+    /// Transcript as recognized, before polishing. Kept only when it differs from
+    /// the delivered text, so a re-polish starts from the raw transcript instead
+    /// of re-polishing already-polished prose.
+    #[serde(rename = "rawText", default, skip_serializing_if = "Option::is_none")]
+    pub raw_text: Option<String>,
+}
+
+/// Polish provenance for a finished session: enough to re-run the polish later
+/// from the history list. Default (both `None`) means the session was never
+/// polished, e.g. the main hotkey.
+#[derive(Debug, Clone, Default)]
+pub struct PolishRecord {
+    pub prompt_id: Option<String>,
+    pub raw_text: Option<String>,
 }
 
 pub struct StatsService {
@@ -67,6 +85,7 @@ impl StatsService {
         text: &str,
         audio_path: Option<String>,
         retry_of: Option<String>,
+        polish: PolishRecord,
     ) {
         if text.is_empty() {
             return;
@@ -96,55 +115,44 @@ impl StatsService {
             audio_path,
             error: None,
             retry_of,
+            prompt_id: polish.prompt_id,
+            raw_text: polish.raw_text,
         };
         self.append_history(&entry);
     }
 
-    pub fn replace_history_with_success(
-        &mut self,
-        ts: &str,
-        text: &str,
-        audio_path: Option<String>,
-    ) -> bool {
-        if text.is_empty() {
-            return false;
-        }
-
-        let Ok(d) = chrono::DateTime::parse_from_rfc3339(ts) else {
+    /// Apply `mutate` to the history entry with this timestamp and rewrite its
+    /// day file in place. Lines that fail to parse are passed through untouched,
+    /// so one corrupt record never costs the user the rest of that day's history.
+    /// Returns `true` when a matching entry was found and the file was rewritten.
+    fn mutate_history_entry<F>(&self, ts: &str, mut mutate: F) -> bool
+    where
+        F: FnMut(&mut HistoryEntry),
+    {
+        let Ok(parsed) = chrono::DateTime::parse_from_rfc3339(ts) else {
             return false;
         };
-        let local = d.with_timezone(&Local);
-        let key = local.format("%Y-%m-%d").to_string();
+        let key = parsed.with_timezone(&Local).format("%Y-%m-%d").to_string();
         let file_path = self.history_dir.join(format!("{}.jsonl", key));
         let Ok(content) = fs::read_to_string(&file_path) else {
             return false;
         };
 
         let mut replaced = false;
-        let char_count = text.len();
         let mut next_lines = Vec::new();
         for line in content.lines().filter(|line| !line.is_empty()) {
-            match serde_json::from_str::<HistoryEntry>(line) {
-                Ok(mut entry) if entry.ts == ts => {
-                    entry.text = text.to_string();
-                    entry.chars = char_count;
-                    entry.status = "success".to_string();
-                    entry.audio_path = audio_path.clone();
-                    entry.error = None;
-                    entry.retry_of = None;
-                    if let Ok(json) = serde_json::to_string(&entry) {
-                        next_lines.push(json);
-                        replaced = true;
-                    } else {
-                        next_lines.push(line.to_string());
-                    }
-                }
-                Ok(entry) => {
-                    if let Ok(json) = serde_json::to_string(&entry) {
-                        next_lines.push(json);
-                    } else {
-                        next_lines.push(line.to_string());
-                    }
+            let Ok(mut entry) = serde_json::from_str::<HistoryEntry>(line) else {
+                next_lines.push(line.to_string());
+                continue;
+            };
+            let is_target = entry.ts == ts;
+            if is_target {
+                mutate(&mut entry);
+            }
+            match serde_json::to_string(&entry) {
+                Ok(json) => {
+                    next_lines.push(json);
+                    replaced |= is_target;
                 }
                 Err(_) => next_lines.push(line.to_string()),
             }
@@ -153,12 +161,35 @@ impl StatsService {
         if !replaced {
             return false;
         }
+        fs::write(&file_path, format!("{}\n", next_lines.join("\n"))).is_ok()
+    }
 
-        if fs::write(&file_path, format!("{}\n", next_lines.join("\n"))).is_err() {
+    /// Turn a recorded failure into a success after a retry produced text.
+    pub fn replace_history_with_success(
+        &mut self,
+        ts: &str,
+        text: &str,
+        audio_path: Option<String>,
+        polish: PolishRecord,
+    ) -> bool {
+        if text.is_empty() {
             return false;
         }
-        self.record_usage(text);
-        true
+        let char_count = text.len();
+        let replaced = self.mutate_history_entry(ts, |entry| {
+            entry.text = text.to_string();
+            entry.chars = char_count;
+            entry.status = "success".to_string();
+            entry.audio_path = audio_path.clone();
+            entry.error = None;
+            entry.retry_of = None;
+            entry.prompt_id = polish.prompt_id.clone();
+            entry.raw_text = polish.raw_text.clone();
+        });
+        if replaced {
+            self.record_usage(text);
+        }
+        replaced
     }
 
     /// Rewrite an existing successful entry's text in place, preserving its
@@ -166,52 +197,41 @@ impl StatsService {
     /// recording whose original transcription lost content. Aggregate usage
     /// counters are left untouched — this replaces text rather than adding a new
     /// session. Returns `true` when a matching entry was found and rewritten.
+    ///
+    /// The new text is a fresh unpolished transcript, so any stored `raw_text` is
+    /// dropped: a later re-polish must start from this text, not the old one.
     pub fn update_history_text(&mut self, ts: &str, text: &str) -> bool {
         if text.is_empty() {
             return false;
         }
-
-        let Ok(d) = chrono::DateTime::parse_from_rfc3339(ts) else {
-            return false;
-        };
-        let local = d.with_timezone(&Local);
-        let key = local.format("%Y-%m-%d").to_string();
-        let file_path = self.history_dir.join(format!("{}.jsonl", key));
-        let Ok(content) = fs::read_to_string(&file_path) else {
-            return false;
-        };
-
-        let mut replaced = false;
         let char_count = text.len();
-        let mut next_lines = Vec::new();
-        for line in content.lines().filter(|line| !line.is_empty()) {
-            match serde_json::from_str::<HistoryEntry>(line) {
-                Ok(mut entry) if entry.ts == ts => {
-                    entry.text = text.to_string();
-                    entry.chars = char_count;
-                    if let Ok(json) = serde_json::to_string(&entry) {
-                        next_lines.push(json);
-                        replaced = true;
-                    } else {
-                        next_lines.push(line.to_string());
-                    }
-                }
-                Ok(entry) => {
-                    if let Ok(json) = serde_json::to_string(&entry) {
-                        next_lines.push(json);
-                    } else {
-                        next_lines.push(line.to_string());
-                    }
-                }
-                Err(_) => next_lines.push(line.to_string()),
-            }
-        }
+        self.mutate_history_entry(ts, |entry| {
+            entry.text = text.to_string();
+            entry.chars = char_count;
+            entry.raw_text = None;
+        })
+    }
 
-        if !replaced {
+    /// Rewrite an entry after a successful re-polish, remembering the transcript
+    /// and template it was polished from so the entry stays re-polishable. Usage
+    /// counters are left untouched: this replaces text rather than adding a session.
+    pub fn update_history_polished_text(
+        &mut self,
+        ts: &str,
+        text: &str,
+        raw_text: &str,
+        prompt_id: &str,
+    ) -> bool {
+        if text.is_empty() {
             return false;
         }
-
-        fs::write(&file_path, format!("{}\n", next_lines.join("\n"))).is_ok()
+        let char_count = text.len();
+        self.mutate_history_entry(ts, |entry| {
+            entry.text = text.to_string();
+            entry.chars = char_count;
+            entry.raw_text = Some(raw_text.to_string());
+            entry.prompt_id = Some(prompt_id.to_string());
+        })
     }
 
     pub fn record_failure(
@@ -230,6 +250,8 @@ impl StatsService {
             audio_path,
             error: Some(message.to_string()),
             retry_of,
+            prompt_id: None,
+            raw_text: None,
         };
         self.append_history(&entry);
         ts
@@ -430,6 +452,8 @@ mod tests {
             audio_path: None,
             error: None,
             retry_of: None,
+            prompt_id: None,
+            raw_text: None,
         };
         let json = serde_json::to_string(&entry).unwrap();
         assert!(json.contains("hello"));
@@ -447,7 +471,7 @@ mod tests {
     #[test]
     fn record_session_increments_counters() {
         let (mut svc, _dir) = new_stats_service();
-        svc.record_session_with_audio("hello world", None, None);
+        svc.record_session_with_audio("hello world", None, None, PolishRecord::default());
         let stats = svc.get_stats();
         assert_eq!(stats.total_sessions, 1);
         assert_eq!(stats.total_characters, 11); // "hello world".len()
@@ -457,7 +481,7 @@ mod tests {
     #[test]
     fn record_session_empty_text_ignored() {
         let (mut svc, _dir) = new_stats_service();
-        svc.record_session_with_audio("", None, None);
+        svc.record_session_with_audio("", None, None, PolishRecord::default());
         let stats = svc.get_stats();
         assert_eq!(stats.total_sessions, 0);
     }
@@ -465,8 +489,8 @@ mod tests {
     #[test]
     fn record_session_multiple_increments() {
         let (mut svc, _dir) = new_stats_service();
-        svc.record_session_with_audio("first", None, None);
-        svc.record_session_with_audio("second", None, None);
+        svc.record_session_with_audio("first", None, None, PolishRecord::default());
+        svc.record_session_with_audio("second", None, None, PolishRecord::default());
         let stats = svc.get_stats();
         assert_eq!(stats.total_sessions, 2);
         assert_eq!(stats.total_characters, 11);
@@ -475,7 +499,7 @@ mod tests {
     #[test]
     fn daily_counts_populated() {
         let (mut svc, _dir) = new_stats_service();
-        svc.record_session_with_audio("test", None, None);
+        svc.record_session_with_audio("test", None, None, PolishRecord::default());
         let stats = svc.get_stats();
         assert_eq!(stats.daily_counts.len(), 1);
         let today = chrono::Local::now().format("%Y-%m-%d").to_string();
@@ -575,7 +599,12 @@ mod tests {
         let failure_ts = svc.record_failure("timeout", Some("/tmp/retry.wav".to_string()), None);
 
         assert_eq!(failure_ts[0..10], today);
-        assert!(svc.replace_history_with_success(&failure_ts, "重试成功", None));
+        assert!(svc.replace_history_with_success(
+            &failure_ts,
+            "重试成功",
+            None,
+            PolishRecord::default()
+        ));
 
         let history = svc.get_history(365);
         assert_eq!(history.len(), 1);
@@ -589,9 +618,117 @@ mod tests {
     }
 
     #[test]
+    fn polish_provenance_round_trips_through_history() {
+        let (mut svc, _dir) = new_stats_service();
+        svc.record_session_with_audio(
+            "润色后的文本",
+            None,
+            None,
+            PolishRecord {
+                prompt_id: Some("polish".to_string()),
+                raw_text: Some("原始 转写 文本".to_string()),
+            },
+        );
+
+        let entry = svc.get_history(365).remove(0);
+        assert_eq!(entry.prompt_id.as_deref(), Some("polish"));
+        assert_eq!(entry.raw_text.as_deref(), Some("原始 转写 文本"));
+    }
+
+    #[test]
+    fn unpolished_session_stores_no_provenance() {
+        let (mut svc, _dir) = new_stats_service();
+        svc.record_session_with_audio("主快捷键直接粘贴", None, None, PolishRecord::default());
+
+        let entry = svc.get_history(365).remove(0);
+        assert!(entry.prompt_id.is_none());
+        assert!(entry.raw_text.is_none());
+    }
+
+    #[test]
+    fn history_entries_written_before_polish_provenance_still_load() {
+        // Entries on disk from earlier versions have neither field; serde
+        // defaults must keep them readable instead of dropping the day's file.
+        let legacy =
+            r#"{"ts":"2026-01-01T10:00:00+08:00","text":"旧记录","chars":9,"status":"success"}"#;
+        let entry: HistoryEntry = serde_json::from_str(legacy).expect("legacy entry parses");
+        assert_eq!(entry.text, "旧记录");
+        assert!(entry.prompt_id.is_none());
+        assert!(entry.raw_text.is_none());
+    }
+
+    #[test]
+    fn update_history_polished_text_keeps_the_source_transcript() {
+        let (mut svc, _dir) = new_stats_service();
+        svc.record_session_with_audio(
+            "原始转写",
+            None,
+            None,
+            PolishRecord {
+                prompt_id: Some("polish".to_string()),
+                raw_text: None,
+            },
+        );
+        let ts = svc.get_history(365)[0].ts.clone();
+        let sessions_before = svc.get_stats().total_sessions;
+
+        assert!(svc.update_history_polished_text(&ts, "润色后的文本", "原始转写", "polish"));
+
+        let entry = svc.get_history(365).remove(0);
+        assert_eq!(entry.text, "润色后的文本");
+        assert_eq!(entry.chars, "润色后的文本".len());
+        assert_eq!(entry.raw_text.as_deref(), Some("原始转写"));
+        // Still re-polishable, and no extra session was counted.
+        assert_eq!(entry.prompt_id.as_deref(), Some("polish"));
+        assert_eq!(svc.get_stats().total_sessions, sessions_before);
+    }
+
+    #[test]
+    fn update_history_polished_text_records_the_chosen_template() {
+        // A main-hotkey entry was never polished; polishing it from the history
+        // list must remember the template so the next re-polish reuses it.
+        let (mut svc, _dir) = new_stats_service();
+        svc.record_session_with_audio("原始转写", None, None, PolishRecord::default());
+        let ts = svc.get_history(365)[0].ts.clone();
+
+        assert!(svc.update_history_polished_text(&ts, "润色后", "原始转写", "email"));
+
+        let entry = svc.get_history(365).remove(0);
+        assert_eq!(entry.prompt_id.as_deref(), Some("email"));
+        assert_eq!(entry.raw_text.as_deref(), Some("原始转写"));
+    }
+
+    #[test]
+    fn update_history_text_drops_stale_raw_text() {
+        let (mut svc, _dir) = new_stats_service();
+        svc.record_session_with_audio(
+            "润色后",
+            None,
+            None,
+            PolishRecord {
+                prompt_id: Some("polish".to_string()),
+                raw_text: Some("旧转写".to_string()),
+            },
+        );
+        let ts = svc.get_history(365)[0].ts.clone();
+
+        assert!(svc.update_history_text(&ts, "新转写"));
+
+        let entry = svc.get_history(365).remove(0);
+        assert_eq!(entry.text, "新转写");
+        assert!(entry.raw_text.is_none());
+        assert_eq!(entry.prompt_id.as_deref(), Some("polish"));
+    }
+
+    #[test]
     fn update_history_text_rewrites_entry_in_place() {
         let (mut svc, _dir) = new_stats_service();
-        svc.record_session_with_audio("old text", Some("/tmp/kept.wav".to_string()), None);
+        svc.record_session_with_audio(
+            "old text",
+            Some("/tmp/kept.wav".to_string()),
+            None,
+            PolishRecord::default(),
+        );
         let ts = svc.get_history(365)[0].ts.clone();
         let sessions_before = svc.get_stats().total_sessions;
 
@@ -612,7 +749,7 @@ mod tests {
     #[test]
     fn update_history_text_missing_entry_returns_false() {
         let (mut svc, _dir) = new_stats_service();
-        svc.record_session_with_audio("only entry", None, None);
+        svc.record_session_with_audio("only entry", None, None, PolishRecord::default());
         let ts = svc.get_history(365)[0].ts.clone();
         // A timestamp on the same day but not matching any entry.
         let other_ts = format!("{}9", &ts[..ts.len() - 1]);

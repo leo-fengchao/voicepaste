@@ -1,13 +1,14 @@
-import type { ReactNode } from "react";
+import type { MouseEvent, ReactNode } from "react";
 
 interface ButtonProps {
   children: ReactNode;
-  onClick?: () => void;
+  onClick?: (event: MouseEvent<HTMLButtonElement>) => void;
   variant?: "default" | "accent" | "danger" | "ghost";
   size?: "sm" | "md" | "icon";
   className?: string;
   disabled?: boolean;
   type?: "button" | "submit";
+  title?: string;
 }
 
 export function Button({
@@ -18,6 +19,7 @@ export function Button({
   className = "",
   disabled,
   type = "button",
+  title,
 }: ButtonProps) {
   const base =
     "inline-flex items-center gap-1 font-medium rounded-md transition-colors focus:outline-none justify-center";
@@ -36,6 +38,7 @@ export function Button({
       className={`${base} ${sizes} ${variants[variant]} ${disabled ? "opacity-50 pointer-events-none" : ""} ${className}`}
       onClick={onClick}
       disabled={disabled}
+      title={title}
     >
       {children}
     </button>

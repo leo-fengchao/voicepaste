@@ -12,7 +12,17 @@ use crate::overlay;
 use super::capture;
 use super::cue;
 use super::history;
+use super::polish;
 use super::{current_session_text, emit_hint, reset_matcher_recording};
+
+/// Whether the finishing pipeline actually delivered text, or parked it awaiting
+/// the user's decision after a failed polish. `Deferred` keeps the overlay up:
+/// the caller must not hide it or clear the failure affordance.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FinalizeOutcome {
+    Delivered,
+    Deferred,
+}
 
 /// Finalize a recording that failed mid-stream (fatal error or exhausted
 /// reconnects): salvage the accumulated text plus the current session's text and
@@ -66,7 +76,13 @@ pub(super) async fn finalize_on_failure(
         combined.chars().count(),
         message
     );
-    finalize_and_paste(app, app_inner, combined).await;
+    let outcome = finalize_and_paste(app, app_inner, combined).await;
+
+    // A failed polish parked the salvaged text and settled the app state: keep
+    // the overlay up for the retry / ESC / auto-paste decision.
+    if outcome == FinalizeOutcome::Deferred {
+        return;
+    }
 
     if let Some(overlay) = app.get_window("overlay") {
         let _ = overlay.hide();
@@ -83,7 +99,7 @@ pub(super) async fn finalize_and_paste(
     app_handle: &AppHandle,
     app_inner: &Arc<app_state::AppInner>,
     raw_text: String,
-) {
+) -> FinalizeOutcome {
     let trimmed = raw_text.trim().to_string();
 
     // Always clear the active prompt ID once a recording concludes.
@@ -96,7 +112,7 @@ pub(super) async fn finalize_and_paste(
 
     if trimmed.is_empty() {
         log_rec!(warn, "Final text is empty, skipping paste");
-        return;
+        return FinalizeOutcome::Delivered;
     }
 
     log_rec!(
@@ -160,8 +176,8 @@ pub(super) async fn finalize_and_paste(
 
     // Apply LLM structure_text only when a prompt-specific hotkey was used.
     // The main hotkey (active_prompt_id = None) pastes raw text without polishing.
-    let final_text = match &config {
-        Some(config) if active_prompt_id.is_some() => {
+    let final_text = match (&config, &active_prompt_id) {
+        (Some(config), Some(prompt_id)) => {
             let prompts = app_inner.config_manager.load_prompts();
             let hotwords = app_inner.hotword_manager.active_words();
             // Show a "润色中…" hint (with shimmer) while the LLM is working.
@@ -169,7 +185,7 @@ pub(super) async fn finalize_and_paste(
             match crate::llm::polish_transcript(
                 config,
                 &prompts,
-                active_prompt_id.as_deref(),
+                Some(prompt_id.as_str()),
                 &hotwords,
                 &registry,
                 &trimmed,
@@ -189,10 +205,12 @@ pub(super) async fn finalize_and_paste(
                     );
                     t
                 }
+                // Do not paste yet: show why it failed and hand the user the
+                // retry / ESC / auto-deliver window instead of silently
+                // dropping them back to the unpolished text.
                 crate::llm::PolishOutcome::Failed(e) => {
-                    log_rec!(warn, "LLM polishing failed: {}, using raw text", e);
-                    emit_hint(app_handle, "文本润色失败，已输出原文", "warn", "text");
-                    trimmed.clone()
+                    polish::arm_pending_polish(app_handle, app_inner, trimmed, prompt_id, &e).await;
+                    return FinalizeOutcome::Deferred;
                 }
                 crate::llm::PolishOutcome::NotPolished => trimmed.clone(),
             }
@@ -200,16 +218,32 @@ pub(super) async fn finalize_and_paste(
         _ => trimmed.clone(),
     };
 
-    // Write to clipboard
+    // Remember what this entry was polished with, so the history list can offer
+    // a re-polish. The raw transcript is kept only when polishing changed it.
+    let polish = crate::stats::PolishRecord {
+        prompt_id: active_prompt_id.clone(),
+        raw_text: (active_prompt_id.is_some() && final_text != trimmed).then(|| trimmed.clone()),
+    };
+    deliver_text(app_handle, app_inner, &final_text, config.as_ref(), polish).await;
+    FinalizeOutcome::Delivered
+}
+
+/// Write text to the clipboard, simulate the paste keystroke, restore the
+/// previous clipboard when configured, record usage stats and play the end cue.
+/// Shared by the normal finish and by the deferred polish-retry paths.
+pub(super) async fn deliver_text(
+    app_handle: &AppHandle,
+    app_inner: &Arc<app_state::AppInner>,
+    final_text: &str,
+    config: Option<&crate::config::AppConfig>,
+    polish: crate::stats::PolishRecord,
+) {
     use tauri_plugin_clipboard_manager::ClipboardExt;
 
     // Both modes auto-paste the recognized text. keep_clipboard (ON) leaves the
     // recognized text in the clipboard after pasting; !keep_clipboard (OFF,
     // default) restores whatever the clipboard held beforehand.
-    let keep_clipboard = config
-        .as_ref()
-        .map(|c| c.app.keep_clipboard)
-        .unwrap_or(true);
+    let keep_clipboard = config.map(|c| c.app.keep_clipboard).unwrap_or(true);
 
     // Snapshot the clipboard before overwriting it so we can restore it after
     // the paste. Only needed when OFF (ON keeps the recognized text).
@@ -219,7 +253,7 @@ pub(super) async fn finalize_and_paste(
         None
     };
 
-    if let Err(e) = app_handle.clipboard().write_text(&final_text) {
+    if let Err(e) = app_handle.clipboard().write_text(final_text) {
         log_rec!(error, "Clipboard write failed: {}", e);
         emit_hint(
             app_handle,
@@ -241,15 +275,13 @@ pub(super) async fn finalize_and_paste(
     }
 
     // Record usage stats and retain/delete the WAV according to user settings.
-    let keep_recordings = config
-        .as_ref()
-        .map(|c| c.app.keep_recordings)
-        .unwrap_or(false);
+    let keep_recordings = config.map(|c| c.app.keep_recordings).unwrap_or(false);
     history::record_success_and_apply_retention(
         app_handle,
         app_inner,
-        &final_text,
+        final_text,
         keep_recordings,
+        polish,
     )
     .await;
     cue::emit_cue(app_handle, app_inner, "end");
