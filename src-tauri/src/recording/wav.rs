@@ -73,8 +73,10 @@ pub fn read_wav_16k_mono(path: &std::path::Path) -> Result<Vec<f32>, String> {
     }
     let range = data_range.ok_or_else(|| "WAV 缺少 data chunk".to_string())?;
     Ok(data[range]
-        .chunks_exact(2)
-        .map(|chunk| i16::from_le_bytes([chunk[0], chunk[1]]) as f32 / 32768.0)
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|chunk| i16::from_le_bytes(*chunk) as f32 / 32768.0)
         .collect())
 }
 

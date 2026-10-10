@@ -24,7 +24,11 @@ use crate::app_state::{self, ActivePromptId, RecordingState};
 use crate::hotkey;
 
 pub(crate) use capture::NativeAudioCapture;
-pub(crate) use polish::{repolish_history_entry, retry_pending_polish};
+pub(crate) use polish::repolish_history_entry;
+// Only the native macOS overlay's retry button calls this from outside the
+// module; the Windows overlay is a webview and goes through IPC commands.
+#[cfg(target_os = "macos")]
+pub(crate) use polish::retry_pending_polish;
 pub(crate) use regenerate::regenerate_history_transcription;
 pub(crate) use retry::{retry_history_transcription, retry_latest_failed_transcription};
 
