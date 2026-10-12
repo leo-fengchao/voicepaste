@@ -60,7 +60,10 @@ pub(crate) fn start_hotkey_listener(
 fn build_tap() -> Result<Tap, keytap::Error> {
     match Tap::builder().filter_events().build() {
         Ok(tap) => {
-            log_hotkey!(info, "Filtering keytap active (decision keys are swallowed)");
+            log_hotkey!(
+                info,
+                "Filtering keytap active (decision keys are swallowed)"
+            );
             Ok(tap)
         }
         Err(filter_error) => {
