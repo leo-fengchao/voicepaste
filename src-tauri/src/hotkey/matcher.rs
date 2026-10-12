@@ -64,9 +64,9 @@ impl MatcherState {
 
     /// Advance the machine one event. Returns the actions to dispatch.
     ///
-    /// The caller (the listener) filters out events for keys that are not part
-    /// of any binding via [`is_relevant_hotkey_event`], so `held` only ever
-    /// tracks hotkey-relevant keys.
+    /// The caller (the listener) filters events via
+    /// [`is_relevant_hotkey_event`], so `held` only ever tracks keys that are
+    /// part of some binding, plus modifiers.
     pub fn process(&mut self, kind: EventKind, bindings: &[HotkeyBinding]) -> Vec<HotkeyAction> {
         let mut actions = Vec::new();
         match kind {
@@ -162,6 +162,24 @@ impl MatcherState {
         }
     }
 
+    /// Whether a fresh press of `key` should be swallowed instead of reaching
+    /// the focused app. True only while a recording is active and `key`
+    /// completes a registered chord (every other key of that chord is already
+    /// held, and no modifier outside it): the press is then a command to the
+    /// recording, not typing. While idle nothing is swallowed, so a plain key
+    /// bound as a stop-only prompt hotkey still types normally.
+    ///
+    /// macOS only: the sole caller is the suppression tap in `suppress.rs`.
+    #[cfg(target_os = "macos")]
+    pub(super) fn should_suppress(&self, key: Key, bindings: &[HotkeyBinding]) -> bool {
+        self.recording.is_some()
+            && bindings.iter().any(|b| {
+                b.keys.contains(&key)
+                    && b.keys.iter().all(|k| *k == key || self.held.contains(k))
+                    && no_foreign_modifier(&self.held, b)
+            })
+    }
+
     /// Reclaim `held` keys stuck down by a lost keyup. The listener calls this
     /// from its idle tick, and only while idle (`recording` is None), so it
     /// never interferes with an active recording — hold-to-talk or a toggle
@@ -174,14 +192,37 @@ impl MatcherState {
     }
 }
 
-/// Longest-match resolution: of all bindings whose keys are a subset of `held`,
-/// the one with the most keys wins; ties are broken by registration order
-/// (earlier wins). Replaces the old first-subset-match that let a bare `Ctrl`
-/// steal `Ctrl+Shift`.
+/// Modifiers that must match a binding exactly. `Fn` is deliberately absent:
+/// on laptop keyboards it is how the F-row keys are physically reached.
+const EXACT_MODIFIERS: &[Key] = &[
+    Key::ControlLeft,
+    Key::ControlRight,
+    Key::AltLeft,
+    Key::AltRight,
+    Key::ShiftLeft,
+    Key::ShiftRight,
+    Key::MetaLeft,
+    Key::MetaRight,
+];
+
+/// Whether every held modifier belongs to `binding`. A hotkey `F` must not
+/// fire for `Ctrl+F` — that is the focused app's shortcut, not ours.
+fn no_foreign_modifier(held: &HashSet<Key>, binding: &HotkeyBinding) -> bool {
+    held.iter()
+        .all(|k| !EXACT_MODIFIERS.contains(k) || binding.keys.contains(k))
+}
+
+/// Longest-match resolution: of all bindings whose keys are a subset of `held`
+/// with no foreign modifier held, the one with the most keys wins; ties are
+/// broken by registration order (earlier wins). Replaces the old
+/// first-subset-match that let a bare `Ctrl` steal `Ctrl+Shift`.
 pub fn longest_match(held: &HashSet<Key>, bindings: &[HotkeyBinding]) -> Option<usize> {
     let mut best: Option<(usize, usize)> = None;
     for (i, b) in bindings.iter().enumerate() {
-        if !b.keys.is_empty() && b.keys.iter().all(|k| held.contains(k)) {
+        if !b.keys.is_empty()
+            && b.keys.iter().all(|k| held.contains(k))
+            && no_foreign_modifier(held, b)
+        {
             let len = b.keys.len();
             let take = match best {
                 None => true,
@@ -205,13 +246,15 @@ fn key_is_registered_hotkey_part(key: Key, bindings: &[HotkeyBinding]) -> bool {
     bindings.iter().any(|binding| binding.keys.contains(&key))
 }
 
-/// Whether an event concerns a key that is part of some registered hotkey
-/// binding. The listener drops everything else at the boundary so keys like
-/// CapsLock or NumLock — whose keyup the OS often fails to deliver — can never
-/// enter the matcher's `held` set and jam the toggle cycle.
+/// Whether an event concerns a key the matcher must track: a key that is part
+/// of some registered hotkey binding, or any modifier (needed to reject chords
+/// with a foreign modifier held). The listener drops everything else at the
+/// boundary so keys like CapsLock or NumLock — whose keyup the OS often fails
+/// to deliver — can never enter the matcher's `held` set and jam the toggle
+/// cycle.
 pub(super) fn is_relevant_hotkey_event(kind: EventKind, bindings: &[HotkeyBinding]) -> bool {
     hotkey_event_key(kind)
-        .map(|k| key_is_registered_hotkey_part(k, bindings))
+        .map(|k| EXACT_MODIFIERS.contains(&k) || key_is_registered_hotkey_part(k, bindings))
         .unwrap_or(false)
 }
 
@@ -562,5 +605,124 @@ mod tests {
         m.held.insert(Key::Function);
         m.clear_stale_held();
         assert!(m.held.is_empty());
+    }
+
+    #[test]
+    fn foreign_modifier_blocks_plain_stop_key() {
+        let bindings = [
+            binding(&[Key::F13], "toggle", None),
+            binding(&[Key::F], "toggle", Some("translate")),
+        ];
+        let mut m = MatcherState::new();
+        run_matcher_from(&mut m, &bindings, &[down(Key::F13), up(Key::F13)]);
+        // Ctrl+F belongs to the focused app: the recording keeps running.
+        let actions = run_matcher_from(
+            &mut m,
+            &bindings,
+            &[
+                down(Key::ControlLeft),
+                down(Key::F),
+                up(Key::F),
+                up(Key::ControlLeft),
+            ],
+        );
+        assert!(actions.is_empty());
+        // Releasing Ctrl first must not turn the still-held F into a match.
+        let actions = run_matcher_from(
+            &mut m,
+            &bindings,
+            &[
+                down(Key::ControlLeft),
+                down(Key::F),
+                up(Key::ControlLeft),
+                up(Key::F),
+            ],
+        );
+        assert!(actions.is_empty());
+        // A bare F still stops with its prompt.
+        let actions = run_matcher_from(&mut m, &bindings, &[down(Key::F), up(Key::F)]);
+        assert_eq!(
+            actions,
+            vec![HotkeyAction::StopRecording {
+                prompt_id: Some("translate".to_string())
+            }]
+        );
+    }
+
+    #[test]
+    fn foreign_modifier_blocks_start() {
+        let toggle = [binding(&[Key::F13], "toggle", None)];
+        let events = [
+            down(Key::ShiftLeft),
+            down(Key::F13),
+            up(Key::F13),
+            up(Key::ShiftLeft),
+        ];
+        assert!(run_matcher(&toggle, &events).is_empty());
+        let hold = [binding(&[Key::F13], "hold", None)];
+        assert!(run_matcher(&hold, &events).is_empty());
+    }
+
+    #[test]
+    fn modifiers_are_always_relevant_events() {
+        let bindings = [binding(&[Key::F], "toggle", None)];
+        assert!(is_relevant_hotkey_event(down(Key::ControlLeft), &bindings));
+        assert!(is_relevant_hotkey_event(up(Key::MetaRight), &bindings));
+        assert!(!is_relevant_hotkey_event(down(Key::G), &bindings));
+        assert!(!is_relevant_hotkey_event(down(Key::CapsLock), &bindings));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn suppress_plain_stop_key_only_while_recording() {
+        let bindings = [
+            binding(&[Key::F13], "toggle", None),
+            binding(&[Key::F], "toggle", Some("translate")),
+        ];
+        let mut m = MatcherState::new();
+        // Idle: F is ordinary typing.
+        assert!(!m.should_suppress(Key::F, &bindings));
+
+        run_matcher_from(&mut m, &bindings, &[down(Key::F13), up(Key::F13)]);
+        assert!(m.should_suppress(Key::F, &bindings));
+        assert!(m.should_suppress(Key::F13, &bindings));
+        // Keys outside every binding are never swallowed.
+        assert!(!m.should_suppress(Key::G, &bindings));
+        // Still true once the listener has already seen this keydown.
+        run_matcher_from(&mut m, &bindings, &[down(Key::F)]);
+        assert!(m.should_suppress(Key::F, &bindings));
+
+        // The stop cycle ends the recording; F types again.
+        run_matcher_from(&mut m, &bindings, &[up(Key::F)]);
+        assert!(!m.should_suppress(Key::F, &bindings));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn suppress_chord_key_requires_rest_of_chord_held() {
+        let bindings = [
+            binding(&[Key::F13], "toggle", None),
+            binding(&[Key::ControlLeft, Key::F], "toggle", Some("translate")),
+        ];
+        let mut m = MatcherState::new();
+        run_matcher_from(&mut m, &bindings, &[down(Key::F13), up(Key::F13)]);
+        // Bare F does not complete Ctrl+F — it is dictation-time typing.
+        assert!(!m.should_suppress(Key::F, &bindings));
+        run_matcher_from(&mut m, &bindings, &[down(Key::ControlLeft)]);
+        assert!(m.should_suppress(Key::F, &bindings));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn suppress_skips_plain_key_with_foreign_modifier() {
+        let bindings = [
+            binding(&[Key::F13], "toggle", None),
+            binding(&[Key::F], "toggle", Some("translate")),
+        ];
+        let mut m = MatcherState::new();
+        run_matcher_from(&mut m, &bindings, &[down(Key::F13), up(Key::F13)]);
+        run_matcher_from(&mut m, &bindings, &[down(Key::MetaLeft)]);
+        // Cmd+F must reach the focused app.
+        assert!(!m.should_suppress(Key::F, &bindings));
     }
 }

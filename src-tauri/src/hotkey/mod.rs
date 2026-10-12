@@ -11,6 +11,8 @@ mod listener;
 mod matcher;
 mod parse;
 mod recorder;
+#[cfg(target_os = "macos")]
+mod suppress;
 
 use std::collections::BTreeSet;
 use std::sync::{Arc, RwLock};

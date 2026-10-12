@@ -19,6 +19,9 @@ pub(crate) fn start_hotkey_listener(
     config: HotkeyConfig,
     app_handle: tauri::AppHandle,
 ) -> Result<HotkeyManager, keytap::Error> {
+    #[cfg(target_os = "macos")]
+    super::suppress::ensure_started(&config);
+
     let tap = match Tap::new() {
         Ok(tap) => tap,
         Err(keytap::Error::PermissionDenied) => {
@@ -59,6 +62,10 @@ pub(crate) fn start_hotkey_listener(
 /// running, or we successfully created it post-startup).  Returns `false`
 /// if the tap still cannot be created (e.g. permission still missing).
 pub fn ensure_hotkey_active(config: &HotkeyConfig, app_handle: &tauri::AppHandle) -> bool {
+    // Retried here too: Accessibility may have been granted after startup.
+    #[cfg(target_os = "macos")]
+    super::suppress::ensure_started(config);
+
     {
         let cfg = config.read().unwrap();
         if cfg.tap_active {
@@ -152,8 +159,9 @@ fn run_listener_loop(tap: &Tap, config: &HotkeyConfig, app_handle: &tauri::AppHa
                     });
                 }
 
-                // Allowlist: drop events for keys that are not part of any
-                // registered binding (CapsLock, NumLock, ordinary typing, …).
+                // Allowlist: drop events for keys that are neither part of a
+                // registered binding nor a modifier (CapsLock, NumLock,
+                // ordinary typing, …).
                 // Such keys can jam the matcher's `held` set when their keyup
                 // goes undelivered, so they never enter it.
                 if !is_relevant_hotkey_event(event_kind, &bindings) {

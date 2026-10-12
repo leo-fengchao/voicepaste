@@ -67,5 +67,8 @@ wiremock = "0.6"
 objc2 = "0.6"
 objc2-app-kit = "0.3"
 objc2-foundation = "0.3"
+# Used by hotkey/suppress.rs for the active CGEventTap that swallows hotkey keys.
+objc2-core-foundation = { version = "0.3", default-features = false, features = ["std", "CFRunLoop", "CFMachPort"] }
+objc2-core-graphics = { version = "0.3", default-features = false, features = ["std", "CGEvent", "CGEventTypes"] }
 # Used by overlay.rs to reach the NSWindow of the WebView-less overlay window.
 raw-window-handle = "0.6"
