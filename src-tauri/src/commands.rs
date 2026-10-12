@@ -540,7 +540,18 @@ pub struct HotkeyRecordResult {
     #[serde(rename = "displayString")]
     pub display_string: String,
     pub hotkey: Option<String>,
+    /// Why the recording is rejected as a *main* hotkey: the first key
+    /// pressed was a typing key. The settings page briefly shows the
+    /// recording, then reverts to the previous hotkey and toasts this reason.
+    /// Prompt-hotkey recordings ignore the field (their keys only act while
+    /// a recording runs).
+    #[serde(rename = "invalidReason")]
+    pub invalid_reason: Option<String>,
 }
+
+/// Toast copy shown when a main-hotkey recording starts with a typing key.
+const MAIN_HOTKEY_FIRST_KEY_HINT: &str =
+    "为不影响键盘输入，主键第一个按键需为功能键、Tab 或修饰键（Ctrl/⌘/Shift/Option/Fn）";
 
 /// Record a hotkey combination from the live keyboard using a temporary keytap
 /// tap. Unlike a DOM keydown listener this captures keys the WebView never
@@ -565,15 +576,24 @@ pub async fn record_hotkey(app: AppHandle) -> Result<HotkeyRecordResult, String>
     })?;
 
     Ok(match result {
-        Some(hotkey) => HotkeyRecordResult {
-            keys: vec![hotkey.clone()],
-            display_string: hotkey.clone(),
-            hotkey: Some(hotkey),
-        },
+        Some(recorded) => {
+            let invalid_reason = if crate::hotkey::is_valid_main_first_key(recorded.first_key) {
+                None
+            } else {
+                Some(MAIN_HOTKEY_FIRST_KEY_HINT.to_string())
+            };
+            HotkeyRecordResult {
+                keys: vec![recorded.combo.clone()],
+                display_string: recorded.combo.clone(),
+                hotkey: Some(recorded.combo),
+                invalid_reason,
+            }
+        }
         None => HotkeyRecordResult {
             keys: vec![],
             display_string: String::new(),
             hotkey: None,
+            invalid_reason: None,
         },
     })
 }

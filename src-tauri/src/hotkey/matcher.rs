@@ -168,9 +168,6 @@ impl MatcherState {
     /// held, and no modifier outside it): the press is then a command to the
     /// recording, not typing. While idle nothing is swallowed, so a plain key
     /// bound as a stop-only prompt hotkey still types normally.
-    ///
-    /// macOS only: the sole caller is the suppression tap in `suppress.rs`.
-    #[cfg(target_os = "macos")]
     pub(super) fn should_suppress(&self, key: Key, bindings: &[HotkeyBinding]) -> bool {
         self.recording.is_some()
             && bindings.iter().any(|b| {
@@ -178,6 +175,32 @@ impl MatcherState {
                     && b.keys.iter().all(|k| *k == key || self.held.contains(k))
                     && no_foreign_modifier(&self.held, b)
             })
+    }
+
+    /// Whether a press of `key` must not reach the foreground app at all —
+    /// the decision the keytap suppress predicate runs on every key event.
+    /// Layered on the same exact-match semantics as [`should_suppress`]:
+    ///
+    /// 1. Modifiers never swallow: they carry no character of their own and
+    ///    swallowing one corrupts the system modifier state.
+    /// 2. A key of the *main* binding swallows whenever pressed with no
+    ///    foreign modifier held — a main-hotkey press is always a command
+    ///    (start or stop), so its character must never leak into the focused
+    ///    app. This covers the press that *starts* a recording, which
+    ///    [`should_suppress`] cannot: the recording flag only rises after the
+    ///    key's release (toggle) or asynchronously after the press (hold).
+    /// 3. Otherwise [`should_suppress`]: a prompt stop key completing its
+    ///    chord while a recording runs.
+    pub(super) fn should_swallow(&self, key: Key, bindings: &[HotkeyBinding]) -> bool {
+        if EXACT_MODIFIERS.contains(&key) {
+            return false;
+        }
+        if bindings.iter().any(|b| {
+            b.prompt_id.is_none() && b.keys.contains(&key) && no_foreign_modifier(&self.held, b)
+        }) {
+            return true;
+        }
+        self.should_suppress(key, bindings)
     }
 
     /// Reclaim `held` keys stuck down by a lost keyup. The listener calls this
@@ -672,7 +695,6 @@ mod tests {
         assert!(!is_relevant_hotkey_event(down(Key::CapsLock), &bindings));
     }
 
-    #[cfg(target_os = "macos")]
     #[test]
     fn suppress_plain_stop_key_only_while_recording() {
         let bindings = [
@@ -697,7 +719,6 @@ mod tests {
         assert!(!m.should_suppress(Key::F, &bindings));
     }
 
-    #[cfg(target_os = "macos")]
     #[test]
     fn suppress_chord_key_requires_rest_of_chord_held() {
         let bindings = [
@@ -712,7 +733,6 @@ mod tests {
         assert!(m.should_suppress(Key::F, &bindings));
     }
 
-    #[cfg(target_os = "macos")]
     #[test]
     fn suppress_skips_plain_key_with_foreign_modifier() {
         let bindings = [
@@ -724,5 +744,41 @@ mod tests {
         run_matcher_from(&mut m, &bindings, &[down(Key::MetaLeft)]);
         // Cmd+F must reach the focused app.
         assert!(!m.should_suppress(Key::F, &bindings));
+    }
+
+    #[test]
+    fn swallow_main_key_when_idle() {
+        // The main hotkey's press IS the start command, so it swallows even
+        // before the recording flag rises; a prompt stop key and an unrelated
+        // key stay ordinary typing while idle.
+        let bindings = [
+            binding(&[Key::F13], "toggle", None),
+            binding(&[Key::F], "toggle", Some("translate")),
+        ];
+        let m = MatcherState::new();
+        assert!(m.should_swallow(Key::F13, &bindings));
+        assert!(!m.should_swallow(Key::F, &bindings));
+        assert!(!m.should_swallow(Key::G, &bindings));
+    }
+
+    #[test]
+    fn swallow_never_for_modifiers() {
+        let bindings = [binding(&[Key::ControlLeft, Key::F13], "toggle", None)];
+        let mut m = MatcherState::new();
+        assert!(!m.should_swallow(Key::ControlLeft, &bindings));
+        run_matcher_from(&mut m, &bindings, &[down(Key::ControlLeft)]);
+        // Even mid-chord: swallowing a modifier corrupts the system modifier
+        // state. The chord's non-modifier key still swallows.
+        assert!(!m.should_swallow(Key::ControlLeft, &bindings));
+        assert!(m.should_swallow(Key::F13, &bindings));
+    }
+
+    #[test]
+    fn swallow_main_key_blocked_by_foreign_modifier() {
+        let bindings = [binding(&[Key::F13], "toggle", None)];
+        let mut m = MatcherState::new();
+        run_matcher_from(&mut m, &bindings, &[down(Key::MetaLeft)]);
+        // Cmd+F13 belongs to the foreground app — nothing swallows.
+        assert!(!m.should_swallow(Key::F13, &bindings));
     }
 }

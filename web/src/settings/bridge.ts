@@ -49,6 +49,10 @@ export interface HotkeyRecordResult {
   keys: string[];
   displayString: string;
   hotkey?: string;
+  /** Present when the recording is rejected as a *main* hotkey (its first
+   *  key was a typing key). Main-key callers show it as a toast and keep the
+   *  previous hotkey; prompt-key callers ignore the field. */
+  invalidReason?: string;
 }
 
 export interface UpdateProgress {

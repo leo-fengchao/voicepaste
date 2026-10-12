@@ -33,6 +33,56 @@ fn is_modifier_key(key: Key) -> bool {
     MODIFIER_ORDER.contains(&key)
 }
 
+/// A finalized recording: the canonical config string plus the first key
+/// pressed, which main-hotkey callers validate (see [`is_valid_main_first_key`]).
+pub(crate) struct RecordedCombination {
+    pub combo: String,
+    pub first_key: Key,
+}
+
+/// Whether `key` may be the first key of a *main* hotkey. The main hotkey
+/// fires on a bare press, so a typing key first (a letter, digit, space, …)
+/// would leak its character into the focused app and fire on ordinary
+/// typing; non-typing keys — modifiers, Tab, the F row — do neither. Prompt
+/// stop keys are exempt: they only act while a recording runs, so their
+/// recordings are not validated against this rule.
+pub(crate) fn is_valid_main_first_key(key: Key) -> bool {
+    is_modifier_key(key) || key == Key::Tab || is_function_key(key)
+}
+
+/// Whether `key` is in the F row (F1–F24, matching what the recorder can
+/// spell). Enumerated because `Key` has data-carrying variants and cannot be
+/// range-matched.
+fn is_function_key(key: Key) -> bool {
+    matches!(
+        key,
+        Key::F1
+            | Key::F2
+            | Key::F3
+            | Key::F4
+            | Key::F5
+            | Key::F6
+            | Key::F7
+            | Key::F8
+            | Key::F9
+            | Key::F10
+            | Key::F11
+            | Key::F12
+            | Key::F13
+            | Key::F14
+            | Key::F15
+            | Key::F16
+            | Key::F17
+            | Key::F18
+            | Key::F19
+            | Key::F20
+            | Key::F21
+            | Key::F22
+            | Key::F23
+            | Key::F24
+    )
+}
+
 /// Canonical modifier display/sort rank from [`MODIFIER_ORDER`]. Non-modifiers
 /// get `u8::MAX` (sort last), but this is only ever called on keys that pass
 /// [`is_modifier_key`].
@@ -194,6 +244,17 @@ fn build_hotkey_string(pressed: &BTreeSet<Key>) -> Option<String> {
     }
 }
 
+/// Finalize a recording from the peak pressed set plus the first key pressed.
+/// `first` is always `Some` by the time a combination finalizes (every set
+/// member arrived through a KeyDown); `None` pairs only occur when the
+/// combination itself has no parseable spelling.
+fn finalize(pressed: &BTreeSet<Key>, first: Option<Key>) -> Option<RecordedCombination> {
+    match (build_hotkey_string(pressed), first) {
+        (Some(combo), Some(first_key)) => Some(RecordedCombination { combo, first_key }),
+        _ => None,
+    }
+}
+
 /// Record one hotkey combination from the live keyboard. Mirrors the frontend
 /// DOM recorder's state machine so behaviour stays consistent:
 ///   - keydown accumulates into the pressed set;
@@ -203,7 +264,8 @@ fn build_hotkey_string(pressed: &BTreeSet<Key>) -> Option<String> {
 ///   - `Escape` cancels; elapsed `timeout` with no completion cancels.
 ///
 /// Runs on a dedicated blocking thread; returns `None` on cancel/timeout, else
-/// the config string (e.g. "ControlLeft+A").
+/// the combination plus the first key pressed (main-hotkey callers validate
+/// it via [`is_valid_main_first_key`]).
 ///
 /// # Platform differences
 ///
@@ -218,7 +280,10 @@ fn build_hotkey_string(pressed: &BTreeSet<Key>) -> Option<String> {
 /// pump is starved and the system never injects the hook callback.  Polling
 /// reads the physical keyboard state directly from the kernel, bypassing the
 /// message queue entirely.
-pub(crate) fn record_combination(config: &HotkeyConfig, timeout: Duration) -> Option<String> {
+pub(crate) fn record_combination(
+    config: &HotkeyConfig,
+    timeout: Duration,
+) -> Option<RecordedCombination> {
     // Suppress the resident listener's hotkey matcher so normal hotkeys don't
     // fire while we're capturing a combination.
     {
@@ -251,7 +316,7 @@ pub(crate) fn record_combination(config: &HotkeyConfig, timeout: Duration) -> Op
 // ── macOS / Linux: relay path ────────────────────────────────────────────────
 
 #[cfg(not(target_os = "windows"))]
-fn record_via_relay(config: &HotkeyConfig, timeout: Duration) -> Option<String> {
+fn record_via_relay(config: &HotkeyConfig, timeout: Duration) -> Option<RecordedCombination> {
     let (tx, rx) = crossbeam_channel::bounded::<keytap::Event>(256);
     {
         let mut cfg = config.write().unwrap();
@@ -270,6 +335,7 @@ fn record_via_relay(config: &HotkeyConfig, timeout: Duration) -> Option<String> 
     let _guard = RelayGuard { config };
 
     let mut pressed: BTreeSet<Key> = BTreeSet::new();
+    let mut first_pressed: Option<Key> = None;
     let start = Instant::now();
     let mut finalize_at: Option<Instant> = None;
 
@@ -281,7 +347,7 @@ fn record_via_relay(config: &HotkeyConfig, timeout: Duration) -> Option<String> 
             if Instant::now() >= deadline {
                 finalize_at = None;
                 if !pressed.is_empty() && pressed.iter().all(|&k| is_modifier_key(k)) {
-                    return build_hotkey_string(&pressed);
+                    return finalize(&pressed, first_pressed);
                 }
             }
         }
@@ -291,14 +357,15 @@ fn record_via_relay(config: &HotkeyConfig, timeout: Duration) -> Option<String> 
                 EventKind::KeyDown(Key::Escape) => return None,
                 EventKind::KeyDown(k) => {
                     pressed.insert(k);
+                    first_pressed.get_or_insert(k);
                     if !is_modifier_key(k) {
                         finalize_at = None;
                     }
                 }
                 EventKind::KeyUp(k) => {
                     if !is_modifier_key(k) {
-                        if let Some(s) = build_hotkey_string(&pressed) {
-                            return Some(s);
+                        if let Some(recorded) = finalize(&pressed, first_pressed) {
+                            return Some(recorded);
                         }
                     } else if !pressed.is_empty() && pressed.iter().all(|&k| is_modifier_key(k)) {
                         finalize_at = Some(Instant::now() + Duration::from_millis(300));
@@ -562,8 +629,9 @@ mod windows_poll {
     /// ≥ 50 ms so every press/release straddles at least 5 samples — we never
     /// miss a transition.  An initial baseline snapshot prevents already-held
     /// keys from leaking into the recording.
-    pub(super) fn record_via_polling(timeout: Duration) -> Option<String> {
+    pub(super) fn record_via_polling(timeout: Duration) -> Option<RecordedCombination> {
         let mut pressed: BTreeSet<Key> = BTreeSet::new();
+        let mut first_pressed: Option<Key> = None;
         let mut prev_snapshot = snapshot(); // baseline — ignore pre-held keys
         let start = Instant::now();
         let mut finalize_at: Option<Instant> = None;
@@ -584,6 +652,11 @@ mod windows_poll {
                     PollEvent::Down(Key::Escape) => return None,
                     PollEvent::Down(k) => {
                         pressed.insert(k);
+                        // Polling diffs arrive batched per 10ms snapshot, so
+                        // "first" is approximate when two keys land in the
+                        // same batch — the validation is advisory, never a
+                        // correctness gate, so this is acceptable.
+                        first_pressed.get_or_insert(k);
                         if !is_modifier_key(k) {
                             finalize_at = None;
                         }
@@ -593,8 +666,8 @@ mod windows_poll {
                         // peak (all keys ever pressed during this recording),
                         // matching the hook-based recorder's behaviour.
                         if !is_modifier_key(k) {
-                            if let Some(s) = build_hotkey_string(&pressed) {
-                                return Some(s);
+                            if let Some(recorded) = finalize(&pressed, first_pressed) {
+                                return Some(recorded);
                             }
                         } else if !pressed.is_empty() && pressed.iter().all(|&k| is_modifier_key(k))
                         {
@@ -608,7 +681,7 @@ mod windows_poll {
                 if Instant::now() >= deadline {
                     finalize_at = None;
                     if !pressed.is_empty() && pressed.iter().all(|&k| is_modifier_key(k)) {
-                        return build_hotkey_string(&pressed);
+                        return finalize(&pressed, first_pressed);
                     }
                 }
             }
@@ -800,5 +873,54 @@ mod tests {
     fn build_hotkey_string_single_main_key() {
         let pressed = BTreeSet::from([Key::F13]);
         assert_eq!(build_hotkey_string(&pressed).as_deref(), Some("F13"));
+    }
+
+    #[test]
+    fn valid_main_first_keys() {
+        // Modifiers (incl. Fn), Tab, and the whole F row are allowed.
+        for key in [
+            Key::ControlLeft,
+            Key::MetaRight,
+            Key::ShiftLeft,
+            Key::AltLeft,
+            Key::Function,
+            Key::Tab,
+            Key::F1,
+            Key::F12,
+            Key::F13,
+            Key::F24,
+        ] {
+            assert!(is_valid_main_first_key(key), "{key:?} should be valid");
+        }
+    }
+
+    #[test]
+    fn invalid_main_first_keys() {
+        // Typing keys are rejected — they would leak into the focused app.
+        for key in [
+            Key::F,
+            Key::A,
+            Key::Digit5,
+            Key::Space,
+            Key::Enter,
+            Key::Quote,
+            Key::Numpad0,
+        ] {
+            assert!(!is_valid_main_first_key(key), "{key:?} should be invalid");
+        }
+    }
+
+    #[test]
+    fn finalize_pairs_combo_with_first_pressed_key() {
+        // Press order F then Shift: the combo canonicalizes, the first key
+        // records the (rejected-for-main) typing key.
+        let pressed = BTreeSet::from([Key::F, Key::ShiftLeft]);
+        let recorded = finalize(&pressed, Some(Key::F)).unwrap();
+        assert_eq!(recorded.combo, "ShiftLeft+F");
+        assert_eq!(recorded.first_key, Key::F);
+
+        // Unparsable combinations finalize to None even with a first key.
+        let unparsable = BTreeSet::from([Key::Numpad0]);
+        assert!(finalize(&unparsable, Some(Key::Numpad0)).is_none());
     }
 }

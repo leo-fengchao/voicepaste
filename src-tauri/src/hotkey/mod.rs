@@ -11,8 +11,6 @@ mod listener;
 mod matcher;
 mod parse;
 mod recorder;
-#[cfg(target_os = "macos")]
-mod suppress;
 
 use std::collections::BTreeSet;
 use std::sync::{Arc, RwLock};
@@ -28,7 +26,7 @@ pub use label::current_hotkey_label;
 pub use listener::{ensure_hotkey_active, reset_recording};
 pub use matcher::MatcherState;
 pub use parse::parse_hotkey_string;
-pub(crate) use recorder::record_combination;
+pub(crate) use recorder::{is_valid_main_first_key, record_combination};
 
 // ---------------------------------------------------------------------------
 // Types
@@ -138,6 +136,20 @@ pub fn reload_bindings(
     // Main hotkey
     if !main_hotkey_str.is_empty() {
         if let Some(keys) = parse_hotkey_string(main_hotkey_str) {
+            // Advisory for stored configs: no press order survives in the
+            // config string, so apply the set-based equivalent of the
+            // recorder's first-key rule — the chord should contain at least
+            // one non-typing key, otherwise its character leaks into the
+            // focused app on the press that starts a recording.
+            if !keys.iter().any(|&k| recorder::is_valid_main_first_key(k)) {
+                log_hotkey!(
+                    warn,
+                    "Main hotkey '{}' starts with a typing key — its character reaches the \
+                     focused app on the press that starts a recording; prefer an F-row key \
+                     or a modifier chord",
+                    main_hotkey_str
+                );
+            }
             new_bindings.push(HotkeyBinding {
                 keys,
                 mode: HotkeyMode::from_str(main_mode),

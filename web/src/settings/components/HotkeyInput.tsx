@@ -1,5 +1,5 @@
 import { X } from "lucide-react";
-import { type ReactNode, useCallback, useState } from "react";
+import { type ReactNode, useCallback, useEffect, useState } from "react";
 import type { HotkeyRecordResult } from "@/settings/bridge";
 import { recordHotkey } from "@/settings/bridge";
 import { normalizeHotkeyToken } from "@/settings/lib/hotkey";
@@ -10,6 +10,10 @@ interface HotkeyInputProps {
   isMac: boolean;
   /** Fired with the recorded accelerator + its display string once capture completes. */
   onCommit?: (hotkey: string, displayString: string) => void;
+  /** Fired when the recording is rejected (only main-key callers pass this):
+   *  the first key pressed was a typing key. The recorded combination flashes
+   *  in the field and then reverts to `value`; the parent toasts the reason. */
+  onInvalid?: (reason: string) => void;
   /** Fired when the clear (×) button is clicked. */
   onClear?: () => void;
   /** Permanently disabled display-only field (e.g. the global main key shown as the
@@ -23,6 +27,9 @@ interface HotkeyInputProps {
   onDone?: () => void;
 }
 
+/** How long a rejected recording flashes before reverting to the bound value. */
+const INVALID_PREVIEW_MS = 1500;
+
 /** A hotkey field that doubles as a recorder: clicking it triggers the backend
  *  keytap capture, the result is shown inline, and a × button clears it. The
  *  field is a native `<button>` (so it is keyboard-focusable and a11y-correct);
@@ -31,6 +38,7 @@ export function HotkeyInput({
   value,
   isMac,
   onCommit,
+  onInvalid,
   onClear,
   locked = false,
   busy = false,
@@ -38,6 +46,15 @@ export function HotkeyInput({
   onDone,
 }: HotkeyInputProps) {
   const [recording, setRecording] = useState(false);
+  const [invalidPreview, setInvalidPreview] = useState<string | null>(null);
+
+  // Revert the rejected-recording preview on a timer; cleared early if a new
+  // recording starts or the component goes away.
+  useEffect(() => {
+    if (!invalidPreview) return;
+    const timer = window.setTimeout(() => setInvalidPreview(null), INVALID_PREVIEW_MS);
+    return () => window.clearTimeout(timer);
+  }, [invalidPreview]);
 
   const handleClick = useCallback(async () => {
     if (busy || recording) {
@@ -45,10 +62,18 @@ export function HotkeyInput({
     }
     onStart?.();
     setRecording(true);
+    setInvalidPreview(null);
     // Backend captures the combination via keytap (including keys the WebView
     // never sees, e.g. macOS Fn/Globe). Empty keys = cancelled (Esc) or timeout.
     try {
       const result: HotkeyRecordResult = await recordHotkey();
+      if (result.invalidReason) {
+        // Rejected as a main hotkey: show what was recorded, then revert to
+        // the bound value and let the parent explain why via toast.
+        setInvalidPreview(result.displayString);
+        onInvalid?.(result.invalidReason);
+        return;
+      }
       if (result.keys.length > 0 && result.hotkey) {
         onCommit?.(result.hotkey, result.displayString);
       }
@@ -56,7 +81,7 @@ export function HotkeyInput({
       setRecording(false);
       onDone?.();
     }
-  }, [busy, recording, onStart, onDone, onCommit]);
+  }, [busy, recording, onStart, onDone, onCommit, onInvalid]);
 
   const canClear = !locked && !recording && value.length > 0 && onClear !== undefined;
 
@@ -79,6 +104,8 @@ export function HotkeyInput({
       >
         {recording ? (
           <span className="text-text-muted">请按键…</span>
+        ) : invalidPreview ? (
+          renderHotkeyTokens(invalidPreview, isMac)
         ) : value ? (
           renderHotkeyTokens(value, isMac)
         ) : (

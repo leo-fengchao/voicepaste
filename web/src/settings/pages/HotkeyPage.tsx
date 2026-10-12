@@ -3,6 +3,7 @@ import { loadPrompts, savePrompts } from "@/settings/bridge";
 import { HotkeyInput } from "@/settings/components/HotkeyInput";
 import { KeyCap } from "@/settings/components/KeyCap";
 import { SegmentedControl } from "@/settings/components/SegmentedControl";
+import { Toast, useToast } from "@/settings/components/Toast";
 import {
   PageHeader,
   PageLayout,
@@ -30,6 +31,7 @@ export function HotkeyPage() {
   const hotkeyMode = (app.hotkey_mode as string) || "toggle";
   // Show Apple symbols on macOS, native labels (Ctrl/Alt/Win/Shift) on Windows.
   const isMac = settings?.runtime?.platform === "macos";
+  const { toast, showToast } = useToast();
 
   const [prompts, setPrompts] = useState<PromptItem[]>([]);
   // Which field is currently capturing — only one recorder runs at a time, so
@@ -110,6 +112,7 @@ export function HotkeyPage() {
                   onDone={() => setActiveRecorder(null)}
                   onCommit={(hk) => scheduleSave({ app: { hotkey: hk } })}
                   onClear={() => scheduleSave({ app: { hotkey: "" } })}
+                  onInvalid={(reason) => showToast(reason, "error")}
                 />
               }
             />
@@ -183,6 +186,7 @@ export function HotkeyPage() {
           </SectionItemList>
         </SectionContent>
       </Section>
+      <Toast toast={toast} />
     </PageLayout>
   );
 }

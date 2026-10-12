@@ -19,8 +19,7 @@ pub(crate) fn start_hotkey_listener(
     config: HotkeyConfig,
     app_handle: tauri::AppHandle,
 ) -> Result<HotkeyManager, keytap::Error> {
-    #[cfg(target_os = "macos")]
-    super::suppress::ensure_started(&config);
+    install_suppress_handler(&config);
 
     let tap = match build_tap() {
         Ok(tap) => tap,
@@ -81,15 +80,33 @@ fn build_tap() -> Result<Tap, keytap::Error> {
     }
 }
 
+/// Register the keytap suppress predicate: the per-key decision of which
+/// presses are commands for VoicePaste and must not reach the foreground app.
+/// Runs synchronously inside the platform event callback, so it takes one
+/// short read lock and nothing more.
+///
+/// The captured config handle stays valid across reconfigs (`reload_bindings`
+/// updates the inner state in place), and re-registering on reinit simply
+/// replaces the closure — both calls are idempotent.
+fn install_suppress_handler(config: &HotkeyConfig) {
+    let config = config.clone();
+    keytap::set_suppress_handler(Some(std::sync::Arc::new(move |key: Key| {
+        let Ok(cfg) = config.read() else {
+            return false;
+        };
+        // While the UI hotkey recorder captures a combination, every key must
+        // reach the settings window untouched.
+        !cfg.recording && cfg.matcher.should_swallow(key, &cfg.bindings)
+    })));
+}
+
 /// Try to start the keytap listener if it is not already running.
 ///
 /// Returns `true` if the listener is now active (either it was already
 /// running, or we successfully created it post-startup).  Returns `false`
 /// if the tap still cannot be created (e.g. permission still missing).
 pub fn ensure_hotkey_active(config: &HotkeyConfig, app_handle: &tauri::AppHandle) -> bool {
-    // Retried here too: Accessibility may have been granted after startup.
-    #[cfg(target_os = "macos")]
-    super::suppress::ensure_started(config);
+    install_suppress_handler(config);
 
     {
         let cfg = config.read().unwrap();
