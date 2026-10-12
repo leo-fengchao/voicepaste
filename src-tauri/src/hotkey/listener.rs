@@ -19,7 +19,7 @@ pub(crate) fn start_hotkey_listener(
     config: HotkeyConfig,
     app_handle: tauri::AppHandle,
 ) -> Result<HotkeyManager, keytap::Error> {
-    let tap = match Tap::new() {
+    let tap = match build_tap() {
         Ok(tap) => tap,
         Err(keytap::Error::PermissionDenied) => {
             log_hotkey!(
@@ -53,6 +53,28 @@ pub(crate) fn start_hotkey_listener(
     Ok(HotkeyManager { _config: config })
 }
 
+/// Create the keytap in filtering mode so suppressed keys (decision-window
+/// ESC/Enter) are swallowed instead of reaching the foreground app. Falls
+/// back to listen-only when the stronger Accessibility grant is missing —
+/// hotkeys keep working, only the swallowing degrades.
+fn build_tap() -> Result<Tap, keytap::Error> {
+    match Tap::builder().filter_events().build() {
+        Ok(tap) => {
+            log_hotkey!(info, "Filtering keytap active (decision keys are swallowed)");
+            Ok(tap)
+        }
+        Err(filter_error) => {
+            log_hotkey!(
+                warn,
+                "Filtering keytap unavailable ({:?}) — falling back to listen-only; \
+                 decision keys will also reach the foreground app",
+                filter_error
+            );
+            Tap::new()
+        }
+    }
+}
+
 /// Try to start the keytap listener if it is not already running.
 ///
 /// Returns `true` if the listener is now active (either it was already
@@ -66,7 +88,7 @@ pub fn ensure_hotkey_active(config: &HotkeyConfig, app_handle: &tauri::AppHandle
         }
     }
 
-    let tap = match Tap::new() {
+    let tap = match build_tap() {
         Ok(tap) => tap,
         Err(e) => {
             log_hotkey!(warn, "Still cannot create keytap: {:?}", e);

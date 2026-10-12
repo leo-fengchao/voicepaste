@@ -225,12 +225,46 @@ pub(crate) fn set_enter_enabled_now(app: &AppHandle, enabled: bool) {
     }
 }
 
+/// Hard ceiling on how long the decision keys may stay armed (the 5s window
+/// plus the 90s polish-retry budget, with headroom). Every arm refreshes the
+/// timestamp; if a dismissal path is ever missed, the watchdog releases the
+/// keys — and with them the keytap suppression — so a bug can never leave
+/// the user's Enter/ESC swallowed for good.
+const DECISION_KEYS_WATCHDOG: Duration = Duration::from_secs(100);
+
+/// When the decision keys were last armed (unix ms). Zero = not armed.
+static DECISION_KEYS_ARMED_AT_MS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
 /// Toggle both decision keys (ESC + Enter) at once. The polish flow arms and
 /// dismisses them as a pair so Enter is never left listening after the
 /// decision window or an interrupted retry has ended.
 pub(crate) fn set_decision_keys_enabled(app: &AppHandle, enabled: bool) {
     set_escape_enabled_now(app, enabled);
     set_enter_enabled_now(app, enabled);
+    if enabled {
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        DECISION_KEYS_ARMED_AT_MS.store(now_ms, std::sync::atomic::Ordering::Release);
+        let watchdog_app = app.clone();
+        tauri::async_runtime::spawn(async move {
+            tokio::time::sleep(DECISION_KEYS_WATCHDOG).await;
+            // Zero (or a later arm's timestamp) means the keys were properly
+            // dismissed — or re-armed, in which case that arm's own watchdog
+            // owns the cleanup from here on.
+            if DECISION_KEYS_ARMED_AT_MS.load(std::sync::atomic::Ordering::Acquire) != now_ms {
+                return;
+            }
+            log_rec!(error, "Decision keys stuck armed; watchdog releasing them");
+            set_decision_keys_enabled(&watchdog_app, false);
+        });
+    } else {
+        // Mark the disarm so a pending watchdog stands down instead of
+        // misreporting a healthy release as "stuck armed".
+        DECISION_KEYS_ARMED_AT_MS.store(0, std::sync::atomic::Ordering::Release);
+    }
 }
 
 /// Native macOS overlay renderer. Builds and updates an AppKit pill
