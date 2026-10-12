@@ -148,6 +148,9 @@ pub enum PolishErrorKind {
     Timeout,
     /// Connection never completed (DNS, TLS, proxy, offline).
     Network,
+    /// HTTP 404 whose body does not blame the model name: most often a wrong
+    /// service URL/path rather than a retired model. Not retryable.
+    NotFound,
     /// HTTP 200, but the model spent its whole output budget on reasoning and
     /// was cut off before emitting any answer text (`finish_reason: "length"`).
     Truncated,
@@ -186,8 +189,11 @@ impl PolishError {
     }
 
     /// Whether another attempt could plausibly succeed without the user
-    /// changing anything. Config/auth/model errors are permanent until fixed;
-    /// a truncation is retryable because the retry disables reasoning.
+    /// changing anything. Config/auth/model errors are permanent until fixed.
+    /// A truncation is *not* retried: the request body is identical across
+    /// attempts (reasoning is already disabled on the first one), so retrying
+    /// would only burn the time budget on the same outcome — the decision
+    /// window still offers a manual retry.
     pub fn is_retryable(&self) -> bool {
         matches!(
             self.kind,
@@ -195,7 +201,6 @@ impl PolishError {
                 | PolishErrorKind::ServerError
                 | PolishErrorKind::Timeout
                 | PolishErrorKind::Network
-                | PolishErrorKind::Truncated
                 | PolishErrorKind::EmptyContent
         )
     }
@@ -213,7 +218,8 @@ impl PolishError {
             PolishErrorKind::RateLimit => "请求过于频繁或余额不足，请稍后再试",
             PolishErrorKind::ServerError => "模型服务暂时不可用，请稍后再试",
             PolishErrorKind::Timeout => "模型响应超时",
-            PolishErrorKind::Network => "无法连接模型服务，请检查网络",
+            PolishErrorKind::Network => "无法连接模型服务，请检查网络或服务地址",
+            PolishErrorKind::NotFound => "服务地址不正确或不存在（404），请检查服务地址",
             PolishErrorKind::Truncated => "模型思考占满了输出长度，未能写出正文",
             PolishErrorKind::EmptyContent => "模型没有返回任何内容",
             PolishErrorKind::Parse => "无法解析模型返回内容",
@@ -480,6 +486,8 @@ fn extract_api_error_message(body: &str) -> String {
 /// Map an HTTP failure onto a `PolishError`, preferring the provider's own
 /// wording. A 400 that names the model is reported as a model error so the
 /// message points the user at the model field rather than at "bad request".
+/// A 404 only means "model not found" when the body says so; a bare 404 from
+/// a mis-typed URL would otherwise send the user hunting for a model name.
 fn classify_http_error(status: u16, body: &str) -> PolishError {
     let detail = extract_api_error_message(body);
     let mentions_model = {
@@ -488,7 +496,8 @@ fn classify_http_error(status: u16, body: &str) -> PolishError {
     };
     let kind = match status {
         401 | 403 => PolishErrorKind::Auth,
-        404 => PolishErrorKind::ModelNotFound,
+        404 if mentions_model => PolishErrorKind::ModelNotFound,
+        404 => PolishErrorKind::NotFound,
         429 => PolishErrorKind::RateLimit,
         400 | 422 if mentions_model => PolishErrorKind::ModelNotFound,
         500..=599 => PolishErrorKind::ServerError,
@@ -790,7 +799,7 @@ mod tests {
         assert_eq!(classify_http_error(401, "{}").kind, PolishErrorKind::Auth);
         assert_eq!(
             classify_http_error(404, "{}").kind,
-            PolishErrorKind::ModelNotFound
+            PolishErrorKind::NotFound
         );
         assert_eq!(
             classify_http_error(429, "{}").kind,
@@ -804,6 +813,33 @@ mod tests {
             classify_http_error(400, "{}").kind,
             PolishErrorKind::BadRequest
         );
+    }
+
+    #[test]
+    fn classify_404_blaming_the_model_is_model_not_found() {
+        // OpenAI-style 404 whose body names the model: still a model error.
+        let body = r#"{"error":{"message":"The model `gpt-x` does not exist or you do not have access to it."}}"#;
+        assert_eq!(
+            classify_http_error(404, body).kind,
+            PolishErrorKind::ModelNotFound
+        );
+    }
+
+    #[test]
+    fn classify_404_without_model_word_is_a_url_problem() {
+        // A typo'd URL path answers 404 with no model mention: point the user
+        // at the service address, not at the model name.
+        let error = classify_http_error(404, "404 page not found");
+        assert_eq!(error.kind, PolishErrorKind::NotFound);
+        assert!(error.short_message().contains("服务地址"));
+        assert!(!error.is_retryable());
+    }
+
+    #[test]
+    fn network_headline_mentions_the_service_address() {
+        // DNS/TLS failures cover a wrong URL too, not just a dead network.
+        let error = PolishError::new(PolishErrorKind::Network, "dns error");
+        assert!(error.short_message().contains("服务地址"));
     }
 
     #[test]
@@ -826,6 +862,14 @@ mod tests {
     }
 
     #[test]
+    fn truncated_is_not_retried_but_empty_content_is() {
+        // The request body is identical across attempts, so retrying a
+        // truncation reaps the same truncation; empty content may be transient.
+        assert!(!PolishError::new(PolishErrorKind::Truncated, "").is_retryable());
+        assert!(PolishError::new(PolishErrorKind::EmptyContent, "").is_retryable());
+    }
+
+    #[test]
     fn detail_is_truncated_to_one_line() {
         let long = "x".repeat(MAX_DETAIL_CHARS + 200);
         let error = PolishError::new(PolishErrorKind::BadRequest, long);
@@ -845,6 +889,7 @@ mod tests {
             PolishErrorKind::ServerError,
             PolishErrorKind::Timeout,
             PolishErrorKind::Network,
+            PolishErrorKind::NotFound,
             PolishErrorKind::Truncated,
             PolishErrorKind::EmptyContent,
             PolishErrorKind::Parse,
@@ -904,7 +949,9 @@ mod tests {
         }]});
         let error = parse_completion(&body).unwrap_err();
         assert_eq!(error.kind, PolishErrorKind::Truncated);
-        assert!(error.is_retryable());
+        // Not retried automatically: the retry sends a byte-identical request
+        // (reasoning was already disabled), so it would truncate the same way.
+        assert!(!error.is_retryable());
         assert!(error.user_message().contains("思考"));
     }
 

@@ -103,7 +103,7 @@ pub(super) async fn finalize_and_paste(
     let trimmed = raw_text.trim().to_string();
 
     // Always clear the active prompt ID once a recording concludes.
-    let mut active_prompt_id = app_handle
+    let active_prompt_id = app_handle
         .try_state::<ActivePromptId>()
         .and_then(|s| s.0.lock().unwrap().clone());
     if let Some(active) = app_handle.try_state::<ActivePromptId>() {
@@ -129,18 +129,6 @@ pub(super) async fn finalize_and_paste(
     // Load config + model registry for LLM / behavior settings.
     let config = app_inner.config_manager.load_config().ok();
 
-    // When a prompt-specific stop chord was used, validate the LLM config up
-    // front: a missing key/URL/model would otherwise surface as a generic
-    // "润色失败" after a failed call. Downgrade to raw text on error.
-    if active_prompt_id.is_some() {
-        if let Some(ref cfg) = config {
-            if let Err(e) = crate::llm::validate_llm_config(&cfg.llm) {
-                log_rec!(warn, "LLM config invalid, skipping polish: {}", e);
-                emit_hint(app_handle, &e, "warn", "text");
-                active_prompt_id = None;
-            }
-        }
-    }
     let resource_dir = app_handle
         .path()
         .resource_dir()
@@ -172,6 +160,30 @@ pub(super) async fn finalize_and_paste(
         && (trimmed.ends_with('。') || trimmed.ends_with('.'))
     {
         trimmed.pop();
+    }
+
+    // When a prompt-specific stop chord was used, validate the LLM config before
+    // calling out. A missing key/URL/model parks the text in the same decision
+    // window as a failed polish (after normalization, so what gets parked is
+    // exactly what would have been polished), instead of downgrading to a
+    // one-frame warning followed by an unpolished paste.
+    if let (Some(ref cfg), Some(prompt_id)) = (&config, &active_prompt_id) {
+        if let Err(e) = crate::llm::validate_llm_config(&cfg.llm) {
+            log_rec!(
+                warn,
+                "LLM config invalid, holding text for polish retry: {}",
+                e
+            );
+            polish::arm_pending_polish(
+                app_handle,
+                app_inner,
+                trimmed.clone(),
+                prompt_id,
+                &crate::llm::PolishError::config(e),
+            )
+            .await;
+            return FinalizeOutcome::Deferred;
+        }
     }
 
     // Apply LLM structure_text only when a prompt-specific hotkey was used.
