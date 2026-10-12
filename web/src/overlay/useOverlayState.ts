@@ -1,5 +1,9 @@
 import { useCallback, useEffect, useReducer, useState } from "react";
-import { onOverlayEvent, retryLatestFailedTranscription } from "@/overlay/bridge";
+import {
+  onOverlayEvent,
+  retryLatestFailedTranscription,
+  retryPendingPolish,
+} from "@/overlay/bridge";
 import { type AppState, type HintLevel, INITIAL_OVERLAY_STATE, type OverlayState } from "./types";
 
 /** Resting bar heights before the first audio chunk (matches shared::WAVE_MIN_H). */
@@ -16,12 +20,14 @@ type Action =
       variant?: string;
       retryable?: boolean;
       hotkey?: string;
+      actions?: string;
     }
   | { type: "retry-hide" }
   | { type: "retrying"; value: boolean }
   | { type: "retry-error"; message: string };
 
-function reducer(state: OverlayState, action: Action): OverlayState {
+/** Pure state transition — exported for unit tests. */
+export function reducer(state: OverlayState, action: Action): OverlayState {
   switch (action.type) {
     case "reset":
       return { ...INITIAL_OVERLAY_STATE };
@@ -31,10 +37,12 @@ function reducer(state: OverlayState, action: Action): OverlayState {
       const retryVisible = action.state === "idle" ? state.retryVisible : false;
       let hintText = state.hintText;
       let hintVariant = state.hintVariant;
+      let hintActions = state.hintActions;
       let retryHotkey = state.retryHotkey;
       if (state.hintLevel === "info") {
         hintText = "";
         hintVariant = "text";
+        hintActions = "";
         retryHotkey = "";
       }
       return {
@@ -44,6 +52,7 @@ function reducer(state: OverlayState, action: Action): OverlayState {
         retrying: false,
         hintText,
         hintVariant,
+        hintActions,
         retryHotkey,
       };
     }
@@ -57,6 +66,7 @@ function reducer(state: OverlayState, action: Action): OverlayState {
       const hintText = action.text || "";
       const hintLevel = action.level || "info";
       const hintVariant = action.variant || "text";
+      const hintActions = action.actions || "";
       const retryHotkey = action.hotkey || "";
       const showRetry = action.retryable === true && hintLevel === "error" && hintText.length > 0;
       return {
@@ -64,6 +74,7 @@ function reducer(state: OverlayState, action: Action): OverlayState {
         hintText,
         hintLevel,
         hintVariant,
+        hintActions,
         retryHotkey,
         retryVisible: showRetry,
         retrying: false,
@@ -79,6 +90,7 @@ function reducer(state: OverlayState, action: Action): OverlayState {
         hintText: action.message,
         hintLevel: "error",
         hintVariant: "text",
+        hintActions: "",
         retryVisible: true,
         retrying: false,
       };
@@ -93,7 +105,7 @@ export interface UseOverlayState {
    * `audio:level` payload and computed there via `shared::wave_heights`. Updated
    * ~10×/s; the bars render directly from this with a CSS transition for smoothing. */
   waveHeights: number[];
-  onRetry: () => void;
+  onRetry: () => Promise<void>;
 }
 
 export function useOverlayState(): UseOverlayState {
@@ -135,6 +147,7 @@ export function useOverlayState(): UseOverlayState {
             variant?: string;
             retryable?: boolean;
             hotkey?: string;
+            actions?: string;
           };
           dispatch({
             type: "hint",
@@ -143,6 +156,7 @@ export function useOverlayState(): UseOverlayState {
             variant: p.variant,
             retryable: p.retryable,
             hotkey: p.hotkey,
+            actions: p.actions,
           });
           break;
         }
@@ -161,18 +175,25 @@ export function useOverlayState(): UseOverlayState {
     return () => window.clearTimeout(timer);
   }, [state.retryVisible]);
 
-  const onRetry = useCallback(() => {
+  const onRetry = useCallback(async () => {
     if (!state.retryVisible || state.retrying) return;
     dispatch({ type: "retrying", value: true });
-    retryLatestFailedTranscription()
-      .then(() => dispatch({ type: "retry-hide" }))
-      .catch((error: unknown) => {
-        const message =
-          (error instanceof Error && error.message) ||
-          (typeof error === "string" && error) ||
-          "重试失败";
-        dispatch({ type: "retry-error", message });
-      });
+    try {
+      // A parked polish takes precedence (its text is still unpasted); fall
+      // back to the transcription retry when nothing is pending. No explicit
+      // retry-hide on success: entering finishing hides the affordance, a
+      // re-armed failure re-shows it via its hint event, and a delivered
+      // outcome hides the whole overlay — dispatching here could instead kill
+      // a re-armed hint that raced the invoke resolution.
+      const handled = await retryPendingPolish();
+      if (!handled) await retryLatestFailedTranscription();
+    } catch (error: unknown) {
+      const message =
+        (error instanceof Error && error.message) ||
+        (typeof error === "string" && error) ||
+        "重试失败";
+      dispatch({ type: "retry-error", message });
+    }
   }, [state.retryVisible, state.retrying]);
 
   return { state, waveHeights, onRetry };

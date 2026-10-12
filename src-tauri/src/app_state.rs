@@ -28,6 +28,16 @@ pub struct PendingPolish {
     pub prompt_id: String,
 }
 
+/// Interruption for an in-flight polish retry, triggered by ESC/Enter while
+/// the "润色中…" pass is running.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PolishRetryCommand {
+    /// ESC: abort the retry and discard the text (no paste, no history entry).
+    Cancel,
+    /// Enter: abort the retry and paste the raw text immediately.
+    DeliverRaw,
+}
+
 pub struct AppInner {
     pub state: Mutex<AppState>,
     pub config_manager: ConfigManager,
@@ -68,12 +78,21 @@ pub struct AppInner {
     pub native_audio: Mutex<Option<crate::recording::NativeAudioCapture>>,
     /// A failed LLM polish awaiting the user's decision. While this is set the
     /// recognized text has NOT been pasted yet: the overlay shows why polishing
-    /// failed, the main hotkey retries, ESC delivers the raw text immediately,
-    /// and a timer delivers it automatically if the user does nothing.
+    /// failed, the main hotkey (or retry button) retries, ESC discards the text,
+    /// Enter pastes the raw text immediately, and a timer delivers it
+    /// automatically if the user does nothing.
     pub pending_polish: Mutex<Option<PendingPolish>>,
     /// Generation counter for `pending_polish`. The auto-deliver timer captures
     /// the epoch it was armed with and stands down if a retry or ESC bumped it.
     pub polish_epoch: std::sync::atomic::AtomicU64,
+    /// Whether a polish retry is currently in flight (between taking the
+    /// pending text and delivering/re-arming it). Hotkey routing consults this
+    /// to ignore presses and stray stops while the retry runs.
+    pub polish_retry_active: std::sync::atomic::AtomicBool,
+    /// Sender half of the interruption channel owned by the in-flight polish
+    /// retry task. The receiver lives only inside that task, so commands sent
+    /// after it finished are dropped with it.
+    pub polish_retry_cmd_tx: Mutex<Option<tokio::sync::mpsc::UnboundedSender<PolishRetryCommand>>>,
     /// Smoothed mic level feeding the overlay waveform. Updated by the audio
     /// emitter and consumed by `shared::wave_heights`, so both renderers share one
     /// smoothing state. Reset to 0 whenever the app leaves the Recording state.
@@ -109,6 +128,8 @@ pub fn create_app_state(
         native_audio: Mutex::new(None),
         pending_polish: Mutex::new(None),
         polish_epoch: std::sync::atomic::AtomicU64::new(0),
+        polish_retry_active: std::sync::atomic::AtomicBool::new(false),
+        polish_retry_cmd_tx: Mutex::new(None),
         wave_smoothed: Mutex::new(0.0),
     })
 }

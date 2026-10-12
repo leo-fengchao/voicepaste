@@ -74,6 +74,10 @@ pub struct Model {
     pub hint_level: String,   // "info" | "warn" | "error"
     pub hint_variant: String, // "text" | "progress" | "retry"
     pub hint_retryable: bool,
+    /// Actions line rendered under the hint (smaller, muted): names the keys
+    /// that act on the current state, e.g. "R ⌥ 重试 · Esc 丢弃 · Enter 输出原文".
+    /// Empty for hints without a decision affordance.
+    pub hint_actions: String,
     pub retry_hotkey: String, // formatted main hotkey label, e.g. "R ⌥"
     pub app_state: String,    // "idle" | "connecting" | "recording" | "finishing"
     /// Sticky pill layout (prevents width jitter while recording/finishing).

@@ -10,6 +10,9 @@ export interface OverlayState {
   hintText: string;
   hintLevel: HintLevel;
   hintVariant: string;
+  /** Actions line under the hint (e.g. "R ⌥ 重试 · Esc 丢弃 · Enter 输出原文"),
+   * naming the keys that act on the current state. Empty when not applicable. */
+  hintActions: string;
   retryHotkey: string;
   appState: AppState;
   retryVisible: boolean;
@@ -22,6 +25,7 @@ export const INITIAL_OVERLAY_STATE: OverlayState = {
   hintText: "",
   hintLevel: "info",
   hintVariant: "text",
+  hintActions: "",
   retryHotkey: "",
   appState: "idle",
   retryVisible: false,

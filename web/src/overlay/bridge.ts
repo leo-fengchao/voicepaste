@@ -34,6 +34,13 @@ export async function retryLatestFailedTranscription(): Promise<void> {
   await invoke("retry_latest_failed_transcription");
 }
 
+/** Retry a parked polish (decision-window text) from the overlay.
+ * Returns false when nothing was pending, so the caller can fall back to the
+ * transcription retry. */
+export async function retryPendingPolish(): Promise<boolean> {
+  return invoke("retry_pending_polish");
+}
+
 /** Layout constants shared with the macOS native renderer (`overlay::shared`).
  * Fetched once at startup so the Windows pill sizes identically to the macOS
  * native pill (text width is still measured in the DOM). Field names match the

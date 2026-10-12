@@ -158,6 +158,31 @@ pub(crate) async fn emit_retryable_error_hint(
     );
 }
 
+/// Emit a polish decision-window hint: the error headline plus the `actions`
+/// line the overlay renders underneath (e.g. "Fn 重试 · Esc 丢弃 · Enter 输出原文").
+pub(crate) async fn emit_polish_decision_hint(
+    app: &AppHandle,
+    app_inner: &Arc<app_state::AppInner>,
+    text: &str,
+    actions: &str,
+) {
+    let hotkey = hotkey::current_hotkey_label(app_inner).await;
+    let _ = app.emit(
+        "overlay:event",
+        serde_json::json!({
+            "type": "hint",
+            "payload": {
+                "text": text,
+                "level": "error",
+                "variant": "text",
+                "retryable": true,
+                "hotkey": hotkey,
+                "actions": actions
+            }
+        }),
+    );
+}
+
 pub(crate) fn schedule_retry_overlay_hide(
     app_handle: AppHandle,
     app_inner: Arc<app_state::AppInner>,
@@ -191,6 +216,21 @@ pub(crate) fn set_escape_enabled_now(app: &AppHandle, enabled: bool) {
     if let Some(hc) = app.try_state::<hotkey::HotkeyConfig>() {
         hotkey::set_escape_enabled(&hc, enabled);
     }
+}
+
+/// Directly toggle the Enter confirm key. Only the polish flow uses this.
+pub(crate) fn set_enter_enabled_now(app: &AppHandle, enabled: bool) {
+    if let Some(hc) = app.try_state::<hotkey::HotkeyConfig>() {
+        hotkey::set_enter_enabled(&hc, enabled);
+    }
+}
+
+/// Toggle both decision keys (ESC + Enter) at once. The polish flow arms and
+/// dismisses them as a pair so Enter is never left listening after the
+/// decision window or an interrupted retry has ended.
+pub(crate) fn set_decision_keys_enabled(app: &AppHandle, enabled: bool) {
+    set_escape_enabled_now(app, enabled);
+    set_enter_enabled_now(app, enabled);
 }
 
 /// Native macOS overlay renderer. Builds and updates an AppKit pill

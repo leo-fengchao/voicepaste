@@ -65,6 +65,7 @@ function OverlayApp() {
 
   const visibleHint = visibleHintText(state);
   const hasHint = Boolean(visibleHint);
+  const hasActions = hasHint && Boolean(state.hintActions);
   const isError = state.hintLevel === "error";
   const showSpinner =
     !isError &&
@@ -74,12 +75,16 @@ function OverlayApp() {
   const showWave = state.appState === "recording" && state.hintLevel !== "warn";
   const showDot = isError && !showSpinner;
   const shouldPulse = hasHint && !isError && state.appState !== "idle";
-  const showRetry = state.retryVisible && isError;
+  // The retry button belongs to the ASR-failure affordance; the polish decision
+  // window carries its countdown on the pill border instead (no button).
+  const showRetry = state.retryVisible && isError && !hasActions;
+  const showCountdown = hasActions && isError && state.retryVisible;
 
   const { measureRef, pillRef, transcriptRef, wrap } = useOverlayLayout({
     finalText: state.finalText,
     partialText: state.partialText,
     visibleHintText: visibleHint,
+    actionsText: state.hintActions,
     appState: state.appState,
     retryVisible: showRetry,
     hintLevel: state.hintLevel,
@@ -101,11 +106,14 @@ function OverlayApp() {
           ref={pillRef}
           data-wrap={wrap ? "multi" : "single"}
           className={`pill relative inline-flex min-w-[116px] max-w-full items-center gap-3 overflow-hidden px-4 pl-[14px] ${
-            wrap
+            wrap || hasActions
               ? "rounded-2xl min-h-[56px] py-1.5 [max-height:calc(100vh-68px)]"
               : "h-[40px] rounded-full"
           }`}
         >
+          {/* Decision-window countdown: the pill border empties over the 5s
+              window (conic-gradient sweep), replacing the retry-button ring. */}
+          {showCountdown && <span className="pill-countdown" aria-hidden="true" />}
           {/* Indicator slot: spinner while connecting/finishing/reconnecting, a
               red dot on error; recording shows the waveform here instead. */}
           {(showSpinner || showDot) && (
@@ -177,12 +185,39 @@ function OverlayApp() {
           {/* Body: transcript or hint (mutually exclusive). */}
           <div className="min-w-0 flex-1 text-[14px] font-medium leading-[1.3]">
             {hasHint ? (
-              <span
-                className={`block truncate ${shouldPulse ? "pulse-text" : ""}`}
-                style={{ color: isError ? "#ff9b9b" : undefined }}
-              >
-                {visibleHint}
-              </span>
+              hasActions ? (
+                // Two rows: the hint/error on top (up to two lines), the
+                // decision-key actions underneath — same size as the hint,
+                // centered across the pill, full-opacity so the keys read as
+                // the primary affordance.
+                <div className="min-w-0">
+                  <span
+                    className={`block overflow-hidden break-words leading-[1.3] line-clamp-2 ${shouldPulse ? "pulse-text" : ""}`}
+                    style={{ color: isError ? "#ff9b9b" : undefined }}
+                  >
+                    {visibleHint}
+                  </span>
+                  <span
+                    className="block truncate text-center text-[14px] font-medium leading-[1.2] text-white"
+                    // Negative margins stretch the row across the full pill so
+                    // its centered text aligns with the window, not the text
+                    // column that starts right of the indicator.
+                    style={{
+                      marginLeft: -(metrics.pad_left + metrics.indicator_w + metrics.gap),
+                      marginRight: -metrics.pad_right,
+                    }}
+                  >
+                    {state.hintActions}
+                  </span>
+                </div>
+              ) : (
+                <span
+                  className={`block truncate ${shouldPulse ? "pulse-text" : ""}`}
+                  style={{ color: isError ? "#ff9b9b" : undefined }}
+                >
+                  {visibleHint}
+                </span>
+              )
             ) : (
               <div
                 ref={transcriptRef}

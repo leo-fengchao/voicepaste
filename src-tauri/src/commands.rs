@@ -299,6 +299,14 @@ pub async fn retry_latest_failed_transcription(
     crate::recording::retry_latest_failed_transcription(app).await
 }
 
+/// Retry a parked polish from the overlay retry button. Returns false when
+/// nothing was pending (or a retry is already in flight), so the caller can
+/// fall back to the transcription retry.
+#[tauri::command]
+pub async fn retry_pending_polish(app: AppHandle) -> Result<bool, String> {
+    Ok(crate::recording::retry_pending_polish(app).await)
+}
+
 /// Re-run LLM polishing on a history entry, rewriting its text in place.
 /// `prompt_id` selects the template; omitted, the entry's own template is used.
 #[tauri::command]
@@ -583,8 +591,10 @@ pub async fn select_sound_file(app: AppHandle) -> Result<Option<String>, String>
 }
 
 /// Start previewing a recording, replacing any preview already playing. Emits
-/// `preview:ended` when playback finishes or is stopped, so the settings history
-/// list can return its button to the play state.
+/// `preview:ended` when playback finishes on its own or fails to start, so the
+/// settings history list can return its button to the play state. A preview
+/// that is stopped or replaced emits nothing — the caller already reset its
+/// button when it issued the stop/replace.
 #[tauri::command]
 pub async fn play_recording_preview(
     app: tauri::AppHandle,

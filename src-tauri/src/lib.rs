@@ -152,6 +152,7 @@ pub fn run() {
             commands::delete_history,
             commands::retry_history_transcription,
             commands::retry_latest_failed_transcription,
+            commands::retry_pending_polish,
             commands::regenerate_history_transcription,
             commands::repolish_history_entry,
             commands::send_diagnostic,
