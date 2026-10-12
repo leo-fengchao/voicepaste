@@ -10,6 +10,11 @@ interface HotkeyInputProps {
   isMac: boolean;
   /** Fired with the recorded accelerator + its display string once capture completes. */
   onCommit?: (hotkey: string, displayString: string) => void;
+  /** Whether this field records the global main key: the first-pressed-key
+   *  rule applies (function row / Tab / modifier first) and a rejection
+   *  flashes, reverts, and reports via `onInvalid`. Prompt stop keys pass
+   *  `false` — they only act mid-recording and are never restricted. */
+  validateFirstKey?: boolean;
   /** Fired when the recording is rejected (only main-key callers pass this):
    *  the first key pressed was a typing key. The recorded combination flashes
    *  in the field and then reverts to `value`; the parent toasts the reason. */
@@ -38,6 +43,7 @@ export function HotkeyInput({
   value,
   isMac,
   onCommit,
+  validateFirstKey = false,
   onInvalid,
   onClear,
   locked = false,
@@ -66,7 +72,7 @@ export function HotkeyInput({
     // Backend captures the combination via keytap (including keys the WebView
     // never sees, e.g. macOS Fn/Globe). Empty keys = cancelled (Esc) or timeout.
     try {
-      const result: HotkeyRecordResult = await recordHotkey();
+      const result: HotkeyRecordResult = await recordHotkey(validateFirstKey ? "main" : "prompt");
       if (result.invalidReason) {
         // Rejected as a main hotkey: show what was recorded, then revert to
         // the bound value and let the parent explain why via toast.
@@ -81,7 +87,7 @@ export function HotkeyInput({
       setRecording(false);
       onDone?.();
     }
-  }, [busy, recording, onStart, onDone, onCommit, onInvalid]);
+  }, [busy, recording, onStart, onDone, onCommit, onInvalid, validateFirstKey]);
 
   const canClear = !locked && !recording && value.length > 0 && onClear !== undefined;
 

@@ -94,9 +94,21 @@ fn install_suppress_handler(config: &HotkeyConfig) {
         let Ok(cfg) = config.read() else {
             return false;
         };
-        // While the UI hotkey recorder captures a combination, every key must
-        // reach the settings window untouched.
-        !cfg.recording && cfg.matcher.should_swallow(key, &cfg.bindings)
+        if cfg.recording {
+            // While the UI recorder captures a combination, swallow every key
+            // so neither the settings window nor the IME reacts to it — a
+            // Shift+F recording would otherwise toggle the IME or open the
+            // candidate list. The recorder itself still sees every key: the
+            // tap reports events on its channel before the suppression
+            // decision, and the Windows recorder polls the physical state
+            // entirely. ESC passes through so cancel-recording never depends
+            // on that ordering. Modifiers are unaffected on macOS (they
+            // arrive as FlagsChanged, which is not a swallowable KeyDown);
+            // on Windows swallowing them is safe — down and up are both
+            // swallowed, so the foreground never sees half a press.
+            return key != Key::Escape;
+        }
+        cfg.matcher.should_swallow(key, &cfg.bindings)
     })));
 }
 

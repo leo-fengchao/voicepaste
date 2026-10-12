@@ -540,11 +540,11 @@ pub struct HotkeyRecordResult {
     #[serde(rename = "displayString")]
     pub display_string: String,
     pub hotkey: Option<String>,
-    /// Why the recording is rejected as a *main* hotkey: the first key
-    /// pressed was a typing key. The settings page briefly shows the
-    /// recording, then reverts to the previous hotkey and toasts this reason.
-    /// Prompt-hotkey recordings ignore the field (their keys only act while
-    /// a recording runs).
+    /// Present only for `scope: "main"` recordings rejected because their
+    /// first key pressed was a typing key. The settings page briefly shows
+    /// the recording, then reverts to the previous hotkey and toasts this
+    /// reason. Prompt-stop-key recordings (`scope: "prompt"`) never set it —
+    /// their keys only act while a recording runs.
     #[serde(rename = "invalidReason")]
     pub invalid_reason: Option<String>,
 }
@@ -556,9 +556,14 @@ const MAIN_HOTKEY_FIRST_KEY_HINT: &str =
 /// Record a hotkey combination from the live keyboard using a temporary keytap
 /// tap. Unlike a DOM keydown listener this captures keys the WebView never
 /// sees (e.g. the macOS Fn/Globe key). Blocks on a worker thread for up to
-/// ~10s; resolves with an empty result on Escape or timeout.
+/// ~10s; resolves with an empty result on Escape or timeout. `scope` selects
+/// whether the first-pressed-key rule applies (`"main"` — it does; `"prompt"`
+/// — it does not: prompt stop keys are legal as bare typing keys).
 #[tauri::command]
-pub async fn record_hotkey(app: AppHandle) -> Result<HotkeyRecordResult, String> {
+pub async fn record_hotkey(
+    app: AppHandle,
+    scope: Option<String>,
+) -> Result<HotkeyRecordResult, String> {
     let config = app
         .try_state::<crate::hotkey::HotkeyConfig>()
         .map(|c| c.inner().clone())
@@ -575,13 +580,15 @@ pub async fn record_hotkey(app: AppHandle) -> Result<HotkeyRecordResult, String>
         format!("record_hotkey worker panicked: {e}")
     })?;
 
+    let validate_main = scope.as_deref() == Some("main");
     Ok(match result {
         Some(recorded) => {
-            let invalid_reason = if crate::hotkey::is_valid_main_first_key(recorded.first_key) {
-                None
-            } else {
-                Some(MAIN_HOTKEY_FIRST_KEY_HINT.to_string())
-            };
+            let invalid_reason =
+                if validate_main && !crate::hotkey::is_valid_main_first_key(recorded.first_key) {
+                    Some(MAIN_HOTKEY_FIRST_KEY_HINT.to_string())
+                } else {
+                    None
+                };
             HotkeyRecordResult {
                 keys: vec![recorded.combo.clone()],
                 display_string: recorded.combo.clone(),

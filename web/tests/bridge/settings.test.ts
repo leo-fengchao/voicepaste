@@ -248,22 +248,23 @@ describe("settings bridge — recordHotkey", () => {
     vi.clearAllMocks();
   });
 
-  it("invokes the backend record_hotkey command and returns its result", async () => {
+  it("invokes the backend record_hotkey command with the scope and returns its result", async () => {
     // The backend (keytap) now owns capture, including keys the WebView never
-    // sees as DOM events (e.g. Fn/Globe). The bridge is a thin invoke wrapper.
+    // sees as DOM events (e.g. Fn/Globe). The bridge is a thin invoke wrapper;
+    // the scope decides whether the first-pressed-key rule applies.
     const backendResult = { keys: ["Fn"], displayString: "Fn", hotkey: "Fn" };
     mockInvoke.mockResolvedValueOnce(backendResult);
 
-    const result = await recordHotkey();
+    const result = await recordHotkey("main");
 
-    expect(invoke).toHaveBeenCalledWith("record_hotkey");
+    expect(invoke).toHaveBeenCalledWith("record_hotkey", { scope: "main" });
     expect(result).toEqual(backendResult);
   });
 
   it("forwards an empty result when the user cancels (Escape / timeout)", async () => {
     mockInvoke.mockResolvedValueOnce({ keys: [], displayString: "", hotkey: undefined });
 
-    const result = await recordHotkey();
+    const result = await recordHotkey("prompt");
 
     expect(result.keys).toEqual([]);
     expect(result.displayString).toBe("");

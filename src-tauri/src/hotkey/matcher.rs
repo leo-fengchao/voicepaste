@@ -183,12 +183,15 @@ impl MatcherState {
     ///
     /// 1. Modifiers never swallow: they carry no character of their own and
     ///    swallowing one corrupts the system modifier state.
-    /// 2. A key of the *main* binding swallows whenever pressed with no
-    ///    foreign modifier held — a main-hotkey press is always a command
+    /// 2. A key that *completes* the main binding's chord (its other keys
+    ///    already held, no foreign modifier) swallows regardless of the
+    ///    recording flag — a completing main-chord press is always a command
     ///    (start or stop), so its character must never leak into the focused
     ///    app. This covers the press that *starts* a recording, which
     ///    [`should_suppress`] cannot: the recording flag only rises after the
     ///    key's release (toggle) or asynchronously after the press (hold).
+    ///    A chord member pressed *alone* stays ordinary typing — with a
+    ///    `Ctrl+F13` main key, a bare `F13` must not swallow.
     /// 3. Otherwise [`should_suppress`]: a prompt stop key completing its
     ///    chord while a recording runs.
     pub(super) fn should_swallow(&self, key: Key, bindings: &[HotkeyBinding]) -> bool {
@@ -196,7 +199,10 @@ impl MatcherState {
             return false;
         }
         if bindings.iter().any(|b| {
-            b.prompt_id.is_none() && b.keys.contains(&key) && no_foreign_modifier(&self.held, b)
+            b.prompt_id.is_none()
+                && b.keys.contains(&key)
+                && b.keys.iter().all(|k| *k == key || self.held.contains(k))
+                && no_foreign_modifier(&self.held, b)
         }) {
             return true;
         }
@@ -780,5 +786,17 @@ mod tests {
         run_matcher_from(&mut m, &bindings, &[down(Key::MetaLeft)]);
         // Cmd+F13 belongs to the foreground app — nothing swallows.
         assert!(!m.should_swallow(Key::F13, &bindings));
+    }
+
+    #[test]
+    fn swallow_chord_member_alone_is_typing() {
+        // With a Ctrl+F13 main key, a bare F13 neither fires the hotkey nor
+        // swallows — ordinary typing must keep working.
+        let bindings = [binding(&[Key::ControlLeft, Key::F13], "toggle", None)];
+        let mut m = MatcherState::new();
+        assert!(!m.should_swallow(Key::F13, &bindings));
+        // Once the rest of the chord is held, the completing press swallows.
+        run_matcher_from(&mut m, &bindings, &[down(Key::ControlLeft)]);
+        assert!(m.should_swallow(Key::F13, &bindings));
     }
 }

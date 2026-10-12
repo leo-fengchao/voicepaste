@@ -112,6 +112,7 @@ export function HotkeyPage() {
                   onDone={() => setActiveRecorder(null)}
                   onCommit={(hk) => scheduleSave({ app: { hotkey: hk } })}
                   onClear={() => scheduleSave({ app: { hotkey: "" } })}
+                  validateFirstKey
                   onInvalid={(reason) => showToast(reason, "error")}
                 />
               }

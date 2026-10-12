@@ -166,11 +166,13 @@ export async function setLoginItemSettings(enabled: boolean): Promise<LoginItemR
  * Record a custom hotkey via the backend keytap tap. The backend can capture
  * keys the WebView never sees as DOM events (e.g. the macOS Fn/Globe key), so
  * this replaces the former in-page DOM keydown listener. Resolves with
- * { keys, displayString, hotkey }; empty `keys` means the user cancelled
- * (Escape) or the ~10s timeout elapsed.
+ * { keys, displayString, hotkey, invalidReason }; empty `keys` means the user
+ * cancelled (Escape) or the ~10s timeout elapsed. `scope: "main"` applies the
+ * first-pressed-key rule (rejections come back as `invalidReason`); `"prompt"`
+ * never rejects — prompt stop keys are legal bare typing keys.
  */
-export async function recordHotkey(): Promise<HotkeyRecordResult> {
-  return invoke("record_hotkey");
+export async function recordHotkey(scope: "main" | "prompt"): Promise<HotkeyRecordResult> {
+  return invoke("record_hotkey", { scope });
 }
 
 // ---- Statistics + History ----
