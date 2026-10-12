@@ -299,6 +299,25 @@ pub async fn retry_latest_failed_transcription(
     crate::recording::retry_latest_failed_transcription(app).await
 }
 
+/// Retry a parked polish from the overlay retry button. Returns false when
+/// nothing was pending (or a retry is already in flight), so the caller can
+/// fall back to the transcription retry.
+#[tauri::command]
+pub async fn retry_pending_polish(app: AppHandle) -> Result<bool, String> {
+    Ok(crate::recording::retry_pending_polish(app).await)
+}
+
+/// Re-run LLM polishing on a history entry, rewriting its text in place.
+/// `prompt_id` selects the template; omitted, the entry's own template is used.
+#[tauri::command]
+pub async fn repolish_history_entry(
+    app: tauri::AppHandle,
+    ts: String,
+    prompt_id: Option<String>,
+) -> Result<serde_json::Value, String> {
+    crate::recording::repolish_history_entry(app, ts, prompt_id).await
+}
+
 /// Regenerate a successful history entry by re-transcribing its kept recording,
 /// rewriting the entry's text in place. Silent: no overlay, paste, or app-state
 /// change. Requires the entry to have a saved recording (keep-recording on).
@@ -571,10 +590,27 @@ pub async fn select_sound_file(app: AppHandle) -> Result<Option<String>, String>
     Ok(file_path.map(|p| p.to_string()))
 }
 
-/// Play a sound.
+/// Start previewing a recording, replacing any preview already playing. Emits
+/// `preview:ended` when playback finishes on its own or fails to start, so the
+/// settings history list can return its button to the play state. A preview
+/// that is stopped or replaced emits nothing — the caller already reset its
+/// button when it issued the stop/replace.
 #[tauri::command]
-pub async fn play_sound_file(file_path: String) -> Result<(), String> {
-    crate::sound::play_audio_file(&file_path);
+pub async fn play_recording_preview(
+    app: tauri::AppHandle,
+    file_path: String,
+) -> Result<(), String> {
+    use tauri::Emitter;
+    crate::sound::play_preview_file(&file_path, move || {
+        let _ = app.emit("preview:ended", ());
+    });
+    Ok(())
+}
+
+/// Stop the recording preview currently playing, if any.
+#[tauri::command]
+pub async fn stop_recording_preview() -> Result<(), String> {
+    crate::sound::stop_preview();
     Ok(())
 }
 

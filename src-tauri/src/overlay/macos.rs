@@ -5,8 +5,8 @@ use objc2_app_kit::{
     NSAppearance, NSAppearanceNameAqua, NSAppearanceNameDarkAqua, NSApplicationActivationOptions,
     NSAttributedStringNSStringDrawing, NSBezelStyle, NSButton, NSColor, NSFont, NSGlassEffectView,
     NSGlassEffectViewStyle, NSLineBreakMode, NSProgressIndicator, NSProgressIndicatorStyle,
-    NSRunningApplication, NSTextField, NSView, NSVisualEffectBlendingMode, NSVisualEffectMaterial,
-    NSVisualEffectState, NSVisualEffectView, NSWindow, NSWorkspace,
+    NSRunningApplication, NSTextAlignment, NSTextField, NSView, NSVisualEffectBlendingMode,
+    NSVisualEffectMaterial, NSVisualEffectState, NSVisualEffectView, NSWindow, NSWorkspace,
 };
 use objc2_foundation::{
     NSArray, NSAttributedString, NSBundle, NSMutableAttributedString, NSNumber, NSPoint, NSRange,
@@ -109,6 +109,8 @@ struct Views {
     indicator: Retained<NSView>,
     spinner: Retained<NSProgressIndicator>,
     label: Retained<NSTextField>,
+    /// Smaller muted row under `label` naming the decision keys (ESC/Enter/…).
+    actions_label: Retained<NSTextField>,
     bars: [Retained<NSView>; WAVE_N],
     retry_view: Retained<NSView>,
     retry_button: Retained<NSButton>,
@@ -116,8 +118,9 @@ struct Views {
     dot_layer: Retained<AnyObject>, // CALayer for the indicator dot
     retry_track_layer: Retained<AnyObject>, // CALayer for the retry ring track
     retry_progress_layer: Retained<AnyObject>, // CALayer for the retry countdown ring
-    fade_mask: Retained<AnyObject>, // CAGradientLayer for the multi-line top fade
-    applied_variant: String,        // "" (auto/inherit) | "light" | "dark"
+    countdown_layer: Retained<AnyObject>, // CALayer tracing the pill border during the decision window
+    fade_mask: Retained<AnyObject>,       // CAGradientLayer for the multi-line top fade
+    applied_variant: String,              // "" (auto/inherit) | "light" | "dark"
     /// Previous pill width; `f64::NAN` until the first frame. Drives the
     /// grow-only animation decision in `render`.
     last_pill_w: f64,
@@ -142,6 +145,12 @@ extern "C" fn retry_clicked(_this: *mut AnyObject, _sel: Sel, _sender: *mut AnyO
         return;
     };
     tauri::async_runtime::spawn(async move {
+        // The same button serves both retryable failures. A parked polish takes
+        // precedence: its text is still unpasted, so retrying it is what the
+        // ring is counting down against.
+        if crate::recording::retry_pending_polish(app.clone()).await {
+            return;
+        }
         let _ = crate::recording::retry_latest_failed_transcription(app).await;
     });
 }
@@ -231,6 +240,7 @@ fn apply_event(app: &AppHandle, event: &serde_json::Value) {
                 model.hint_level = "info".into();
                 model.hint_variant = "text".into();
                 model.hint_retryable = false;
+                model.hint_actions.clear();
                 model.retry_hotkey.clear();
                 model.layout_width = 0.0;
                 model.layout_wrap = false;
@@ -249,6 +259,7 @@ fn apply_event(app: &AppHandle, event: &serde_json::Value) {
                         model.hint_text.clear();
                         model.hint_variant = "text".into();
                         model.hint_retryable = false;
+                        model.hint_actions.clear();
                         model.retry_hotkey.clear();
                     }
                     // Collapse the waveform when not actively recording.
@@ -289,6 +300,11 @@ fn apply_event(app: &AppHandle, event: &serde_json::Value) {
                     .and_then(|p| p.get("retryable"))
                     .and_then(|v| v.as_bool())
                     .unwrap_or(false);
+                model.hint_actions = payload
+                    .and_then(|p| p.get("actions"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .into();
                 model.retry_hotkey = payload
                     .and_then(|p| p.get("hotkey"))
                     .and_then(|v| v.as_str())
@@ -399,6 +415,17 @@ fn ensure_views(content: &NSView, model: &Model, mtm: MainThreadMarker) {
         // Layer-backed so the hint-text pulse (a layer.opacity animation) works.
         label.setWantsLayer(true);
 
+        // The actions row (e.g. "R ⌥ 重试 · Esc 丢弃 · Enter 输出原文") under an
+        // error hint or a polish-in-progress hint. Same size as the hint text
+        // above and center-aligned across the pill, so the decision keys read
+        // as the primary affordance rather than a footnote.
+        let actions_label = NSTextField::labelWithString(&NSString::from_str(""), mtm);
+        actions_label.setFont(Some(&NSFont::systemFontOfSize(FONT_SIZE)));
+        actions_label.setTextColor(Some(&NSColor::labelColor()));
+        actions_label.setAlignment(NSTextAlignment::Center);
+        actions_label.setLineBreakMode(NSLineBreakMode::ByTruncatingTail);
+        actions_label.setHidden(true);
+
         let indicator = NSView::new(mtm);
         indicator.setWantsLayer(true);
         let dot_layer = make_dot_layer();
@@ -422,12 +449,23 @@ fn ensure_views(content: &NSView, model: &Model, mtm: MainThreadMarker) {
         container.addSubview(&indicator);
         container.addSubview(&spinner);
         container.addSubview(&label);
+        container.addSubview(&actions_label);
 
         let retry_view = NSView::new(mtm);
         retry_view.setWantsLayer(true);
         set_layer_color(&retry_view, &NSColor::clearColor(), RETRY_SIZE / 2.0);
         let retry_track_layer = make_retry_ring_layer();
         let retry_progress_layer = make_retry_ring_layer();
+        // The decision window has no retry button; its countdown traces the
+        // pill's own border instead. Lives on the container's layer so it
+        // follows the pill frame.
+        let countdown_layer = make_retry_ring_layer();
+        unsafe {
+            let container_layer: *mut AnyObject = msg_send![&*container, layer];
+            if !container_layer.is_null() {
+                let _: () = msg_send![container_layer, addSublayer: &*countdown_layer];
+            }
+        }
         unsafe {
             let retry_layer: *mut AnyObject = msg_send![&*retry_view, layer];
             if !retry_layer.is_null() {
@@ -508,6 +546,7 @@ fn ensure_views(content: &NSView, model: &Model, mtm: MainThreadMarker) {
             indicator,
             spinner,
             label,
+            actions_label,
             bars,
             retry_view,
             retry_button,
@@ -515,6 +554,7 @@ fn ensure_views(content: &NSView, model: &Model, mtm: MainThreadMarker) {
             dot_layer,
             retry_track_layer,
             retry_progress_layer,
+            countdown_layer,
             fade_mask: make_fade_mask(),
             applied_variant: "<unset>".into(),
             last_pill_w: f64::NAN,
@@ -623,6 +663,31 @@ fn set_retry_ring_path(layer: &AnyObject, width: f64) {
             clockwise: false
         ];
         let _: () = msg_send![path, closePath];
+        let cg_path: *mut AnyObject = msg_send![path, CGPath];
+        let _: () = msg_send![layer, setPath: cg_path];
+    }
+}
+
+/// Trace the pill's rounded-rect border for the decision-window countdown
+/// layer. Inset by half the line width so the stroke sits fully inside the
+/// pill frame, matching the corner radius used for the glass.
+fn set_pill_border_path(layer: &AnyObject, pill_w: f64, pill_h: f64, radius: f64) {
+    let inset = 1.0; // half of the 2.0 line width
+    let rect = NSRect {
+        origin: NSPoint { x: inset, y: inset },
+        size: NSSize {
+            width: (pill_w - inset * 2.0).max(1.0),
+            height: (pill_h - inset * 2.0).max(1.0),
+        },
+    };
+    unsafe {
+        let cls = objc2::runtime::AnyClass::get(c"NSBezierPath").expect("NSBezierPath");
+        let path: *mut AnyObject = msg_send![
+            cls,
+            bezierPathWithRoundedRect: rect,
+            xRadius: radius,
+            yRadius: radius
+        ];
         let cg_path: *mut AnyObject = msg_send![path, CGPath];
         let _: () = msg_send![layer, setPath: cg_path];
     }
@@ -938,7 +1003,13 @@ fn render(app: &AppHandle, model: &mut Model) {
     let hint = visible_hint(model);
     let has_hint = !hint.is_empty();
     let has_text = !model.final_text.is_empty() || !model.partial_text.is_empty();
-    let show_retry = model.hint_retryable && model.hint_level == "error" && has_hint;
+    let has_actions = has_hint && !model.hint_actions.is_empty();
+    // The retry button belongs to the ASR-failure affordance. The polish
+    // decision window has no button: its actions row and the pill-border
+    // countdown carry the affordance instead.
+    let show_retry =
+        model.hint_retryable && model.hint_level == "error" && has_hint && !has_actions;
+    let show_countdown = has_actions && model.hint_retryable && model.hint_level == "error";
     // Build the retry button title ("重试 (R ⌥)") and size the button to fit it,
     // so the label + hotkey live inside the button rather than in the message.
     let retry_title = retry_title_attr(&model.retry_hotkey);
@@ -972,6 +1043,13 @@ fn render(app: &AppHandle, model: &mut Model) {
             let attr = transcript_attr(model);
             views.label.setAttributedStringValue(&attr);
         }
+        // The actions row rides along under a hint (polish decision window /
+        // polish retry); it names the keys that act on the current state.
+        if has_actions {
+            let s = NSString::from_str(&model.hint_actions);
+            views.actions_label.setStringValue(&s);
+        }
+        views.actions_label.setHidden(!has_actions);
 
         // --- Decide wrap, measure width ---
         // Single-line mode first to measure the natural width.
@@ -982,7 +1060,19 @@ fn render(app: &AppHandle, model: &mut Model) {
             .label
             .setLineBreakMode(NSLineBreakMode::ByTruncatingTail);
         let natural = views.label.intrinsicContentSize();
-        let measured_w = natural.width.ceil();
+        let mut measured_w = natural.width.ceil();
+        // The actions row shares the width budget: the pill must fit the wider
+        // of the two rows.
+        let actions_natural = if has_actions {
+            let size = views.actions_label.intrinsicContentSize();
+            measured_w = measured_w.max(size.width.ceil());
+            size
+        } else {
+            NSSize {
+                width: 0.0,
+                height: 0.0,
+            }
+        };
 
         let lock_layout =
             !has_hint && matches!(model.app_state.as_str(), "recording" | "finishing");
@@ -1038,6 +1128,18 @@ fn render(app: &AppHandle, model: &mut Model) {
             let max_visible = one_line_h * (MAX_LINES as f64) + 4.0;
             let visible = full.min(max_visible);
             ((visible + 16.0).max(56.0), full, visible)
+        } else if has_actions {
+            // Two stacked rows: the hint (allowed to wrap onto a second line,
+            // tail-truncated) over the single-line actions row.
+            views.label.setUsesSingleLineMode(false);
+            views.label.setMaximumNumberOfLines(2);
+            views
+                .label
+                .setLineBreakMode(NSLineBreakMode::ByWordWrapping);
+            views.label.setPreferredMaxLayoutWidth(text_area_w);
+            let label_h = views.label.intrinsicContentSize().height.ceil();
+            let block = label_h + 4.0 + actions_natural.height.ceil();
+            ((block + 16.0).max(56.0), label_h, label_h)
         } else {
             (PILL_H_SINGLE, one_line_h, one_line_h)
         };
@@ -1065,7 +1167,7 @@ fn render(app: &AppHandle, model: &mut Model) {
         views.last_pill_w = pill_w;
         let animate = growing && !has_hint;
         set_frame(views.glass.view(), glass_frame, animate);
-        let radius = if model.layout_wrap {
+        let radius = if model.layout_wrap || has_actions {
             16.0
         } else {
             pill_h / 2.0
@@ -1164,17 +1266,43 @@ fn render(app: &AppHandle, model: &mut Model) {
         // LATEST lines show while older lines overflow upward and get clipped by the
         // container (top fade is a later refinement).
         let label_x = PAD_LEFT + INDICATOR_W + GAP;
-        let pad_v = ((pill_h - visible_text_h) / 2.0).round();
-        views.label.setFrame(NSRect {
-            origin: NSPoint {
-                x: label_x,
-                y: pad_v,
-            },
-            size: NSSize {
-                width: text_area_w,
-                height: full_h,
-            },
-        });
+        if has_actions {
+            // Center the two-row block: hint on top, actions underneath. The
+            // actions row spans the full pill width with centered text, per
+            // the decision-window design.
+            let actions_h = actions_natural.height.ceil();
+            let block_h = visible_text_h + 4.0 + actions_h;
+            let pad_v = ((pill_h - block_h) / 2.0).round();
+            views.label.setFrame(NSRect {
+                origin: NSPoint {
+                    x: label_x,
+                    y: pad_v + actions_h + 4.0,
+                },
+                size: NSSize {
+                    width: text_area_w,
+                    height: full_h,
+                },
+            });
+            views.actions_label.setFrame(NSRect {
+                origin: NSPoint { x: 0.0, y: pad_v },
+                size: NSSize {
+                    width: pill_w,
+                    height: actions_h,
+                },
+            });
+        } else {
+            let pad_v = ((pill_h - visible_text_h) / 2.0).round();
+            views.label.setFrame(NSRect {
+                origin: NSPoint {
+                    x: label_x,
+                    y: pad_v,
+                },
+                size: NSSize {
+                    width: text_area_w,
+                    height: full_h,
+                },
+            });
+        }
 
         // Waveform bars (left, beside the indicator), shown only while recording.
         // Heights come from the WAVE_HEIGHTS thread-local (updated by audio:level).
@@ -1236,6 +1364,29 @@ fn render(app: &AppHandle, model: &mut Model) {
             }
         }
         set_retry_countdown(&views.retry_progress_layer, show_retry);
+
+        // Decision-window countdown: the pill's own border empties over the 5s
+        // window, replacing the button ring the ASR affordance uses.
+        unsafe {
+            let hidden: u8 = if show_countdown { 0 } else { 1 };
+            let _: () = msg_send![&*views.countdown_layer, setHidden: hidden];
+            if show_countdown {
+                let frame = NSRect {
+                    origin: NSPoint { x: 0.0, y: 0.0 },
+                    size: NSSize {
+                        width: pill_w,
+                        height: pill_h,
+                    },
+                };
+                let _: () = msg_send![&*views.countdown_layer, setFrame: frame];
+                set_pill_border_path(&views.countdown_layer, pill_w, pill_h, radius);
+                let _: () = msg_send![&*views.countdown_layer, setLineWidth: 2.0f64];
+                let border = NSColor::colorWithSRGBRed_green_blue_alpha(1.0, 0.231, 0.231, 0.84);
+                let border_cg: *mut AnyObject = msg_send![&*border, CGColor];
+                let _: () = msg_send![&*views.countdown_layer, setStrokeColor: border_cg];
+            }
+        }
+        set_retry_countdown(&views.countdown_layer, show_countdown);
 
         // Keep the pill visible throughout an active session (so the indicator
         // stays up while waiting for the first transcript); only hide it when idle

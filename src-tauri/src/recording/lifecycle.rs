@@ -42,7 +42,12 @@ pub(super) async fn start_recording(app_handle: AppHandle) {
 
     // Prompt-specific LLM validation is deferred to finalize_and_paste: the
     // prompt is resolved from the stop chord (not known at start), and a bad
-    // LLM config surfaces there as "文本润色失败，已输出原文" with the raw text.
+    // LLM config surfaces there with the provider's own reason plus a retry.
+
+    // Settle any parked polish before recording again. Otherwise its auto-paste
+    // timer would fire mid-recording and drop the previous transcript into
+    // whatever now has focus.
+    super::polish::deliver_raw(&app_handle, &app_inner, "superseded by a new recording").await;
 
     *app_inner.latest_transcript.lock().await = (String::new(), String::new());
     app_inner.recording_audio.lock().await.clear();
@@ -242,10 +247,18 @@ pub(super) async fn stop_recording(app_handle: AppHandle) {
         let combined = format!("{}{}", prefix, session_text);
 
         // 5-9. Polish (if applicable), write clipboard, paste, record stats, end cue.
-        finalize::finalize_and_paste(&app_handle, &app_inner, combined).await;
+        let outcome = finalize::finalize_and_paste(&app_handle, &app_inner, combined).await;
 
         // 10. Close the WebSocket session
         session.close();
+
+        if outcome == finalize::FinalizeOutcome::Deferred {
+            // A failed polish parked the text and already settled the app state:
+            // leave the overlay up so the user can retry, ESC out, or let it
+            // auto-paste.
+            *app_inner.accumulated_text.lock().await = String::new();
+            return;
+        }
     } else {
         // No ready session: the connect never completed (or we stopped during a
         // reconnect gap). Drop any buffered audio for this round.
@@ -257,7 +270,14 @@ pub(super) async fn stop_recording(app_handle: AppHandle) {
                 warn,
                 "Stop with no ready session; salvaging accumulated text"
             );
-            finalize::finalize_and_paste(&app_handle, &app_inner, prefix).await;
+            let outcome = finalize::finalize_and_paste(&app_handle, &app_inner, prefix).await;
+            if outcome == finalize::FinalizeOutcome::Deferred {
+                // A failed polish parked the text and already settled the app state:
+                // leave the overlay up so the user can retry, ESC out, or let it
+                // auto-paste.
+                *app_inner.accumulated_text.lock().await = String::new();
+                return;
+            }
         } else {
             log_rec!(
                 warn,

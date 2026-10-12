@@ -22,7 +22,7 @@ pub(crate) fn start_hotkey_listener(
     #[cfg(target_os = "macos")]
     super::suppress::ensure_started(&config);
 
-    let tap = match Tap::new() {
+    let tap = match build_tap() {
         Ok(tap) => tap,
         Err(keytap::Error::PermissionDenied) => {
             log_hotkey!(
@@ -56,6 +56,31 @@ pub(crate) fn start_hotkey_listener(
     Ok(HotkeyManager { _config: config })
 }
 
+/// Create the keytap in filtering mode so suppressed keys (decision-window
+/// ESC/Enter) are swallowed instead of reaching the foreground app. Falls
+/// back to listen-only when the stronger Accessibility grant is missing —
+/// hotkeys keep working, only the swallowing degrades.
+fn build_tap() -> Result<Tap, keytap::Error> {
+    match Tap::builder().filter_events().build() {
+        Ok(tap) => {
+            log_hotkey!(
+                info,
+                "Filtering keytap active (decision keys are swallowed)"
+            );
+            Ok(tap)
+        }
+        Err(filter_error) => {
+            log_hotkey!(
+                warn,
+                "Filtering keytap unavailable ({:?}) — falling back to listen-only; \
+                 decision keys will also reach the foreground app",
+                filter_error
+            );
+            Tap::new()
+        }
+    }
+}
+
 /// Try to start the keytap listener if it is not already running.
 ///
 /// Returns `true` if the listener is now active (either it was already
@@ -73,7 +98,7 @@ pub fn ensure_hotkey_active(config: &HotkeyConfig, app_handle: &tauri::AppHandle
         }
     }
 
-    let tap = match Tap::new() {
+    let tap = match build_tap() {
         Ok(tap) => tap,
         Err(e) => {
             log_hotkey!(warn, "Still cannot create keytap: {:?}", e);
@@ -104,6 +129,7 @@ pub fn ensure_hotkey_active(config: &HotkeyConfig, app_handle: &tauri::AppHandle
 /// matching.
 fn run_listener_loop(tap: &Tap, config: &HotkeyConfig, app_handle: &tauri::AppHandle) {
     let mut escape_was_pressed = false;
+    let mut enter_was_pressed = false;
     // Timestamp of the last received keytap event (any event, even filtered
     // ones — they still prove the user is at the keyboard). When no event has
     // arrived for [`STALE_QUIESCENCE`] yet `held` still holds keys, those keys
@@ -122,12 +148,13 @@ fn run_listener_loop(tap: &Tap, config: &HotkeyConfig, app_handle: &tauri::AppHa
                 // (there is no await point between them), instead of three
                 // independent reads. `bindings` is reused for both the
                 // allowlist check and the matcher, so it is cloned once here.
-                let (is_recording, record_tx, escape_enabled, bindings) = {
+                let (is_recording, record_tx, escape_enabled, enter_enabled, bindings) = {
                     let cfg = config.read().unwrap();
                     (
                         cfg.recording,
                         cfg.record_tx.clone(),
                         cfg.escape_enabled,
+                        cfg.enter_enabled,
                         cfg.bindings.clone(),
                     )
                 };
@@ -156,6 +183,27 @@ fn run_listener_loop(tap: &Tap, config: &HotkeyConfig, app_handle: &tauri::AppHa
                     let handle = app_handle.clone();
                     tauri::async_runtime::spawn(async move {
                         crate::recording::on_escape(handle).await;
+                    });
+                }
+
+                // Enter confirm (paste the raw text), gated the same way as ESC.
+                // Handled before the allowlist because Enter is not part of any
+                // registered binding. Auto-repeat is suppressed via the
+                // was_pressed latch so holding Enter fires once.
+                if matches!(event_kind, EventKind::KeyUp(Key::Enter | Key::NumpadEnter)) {
+                    enter_was_pressed = false;
+                }
+                if enter_enabled
+                    && matches!(
+                        event_kind,
+                        EventKind::KeyDown(Key::Enter | Key::NumpadEnter)
+                    )
+                    && !enter_was_pressed
+                {
+                    enter_was_pressed = true;
+                    let handle = app_handle.clone();
+                    tauri::async_runtime::spawn(async move {
+                        crate::recording::on_enter(handle).await;
                     });
                 }
 

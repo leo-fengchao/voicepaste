@@ -127,16 +127,137 @@ pub fn validate_llm_config(config: &LlmConfig) -> Result<(), String> {
     Ok(())
 }
 
+/// Why an LLM polishing attempt failed. Drives both the retry policy (only
+/// transient kinds are worth another attempt) and the user-facing message, so
+/// the overlay can say *what* to fix instead of a bare "润色失败".
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PolishErrorKind {
+    /// Credentials/URL/model missing locally — nothing to retry until fixed.
+    Config,
+    /// 401 / 403: key rejected by the provider.
+    Auth,
+    /// The model name is unknown or retired at the provider.
+    ModelNotFound,
+    /// Other 4xx: malformed request, unsupported parameter, content filter.
+    BadRequest,
+    /// 429: rate limited or out of quota.
+    RateLimit,
+    /// 5xx: provider-side failure.
+    ServerError,
+    /// The request exceeded the client timeout.
+    Timeout,
+    /// Connection never completed (DNS, TLS, proxy, offline).
+    Network,
+    /// HTTP 404 whose body does not blame the model name: most often a wrong
+    /// service URL/path rather than a retired model. Not retryable.
+    NotFound,
+    /// HTTP 200, but the model spent its whole output budget on reasoning and
+    /// was cut off before emitting any answer text (`finish_reason: "length"`).
+    Truncated,
+    /// HTTP 200, but no usable content came back for some other reason.
+    EmptyContent,
+    /// The response body was not the JSON shape we expect.
+    Parse,
+}
+
+/// A classified polishing failure: the kind drives behavior, `detail` carries
+/// the provider's own explanation (e.g. DeepSeek naming the models it accepts)
+/// so the user can act on it directly.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PolishError {
+    pub kind: PolishErrorKind,
+    pub detail: String,
+}
+
+/// Longest provider error text kept in `detail`. Provider bodies can be large
+/// (some echo the whole request back); the overlay only has room for a line.
+const MAX_DETAIL_CHARS: usize = 300;
+
+impl PolishError {
+    fn new(kind: PolishErrorKind, detail: impl Into<String>) -> Self {
+        let detail: String = detail.into();
+        let detail = if detail.chars().count() > MAX_DETAIL_CHARS {
+            detail.chars().take(MAX_DETAIL_CHARS).collect::<String>() + "…"
+        } else {
+            detail
+        };
+        Self { kind, detail }
+    }
+
+    pub fn config(detail: impl Into<String>) -> Self {
+        Self::new(PolishErrorKind::Config, detail)
+    }
+
+    /// Whether another attempt could plausibly succeed without the user
+    /// changing anything. Config/auth/model errors are permanent until fixed.
+    /// A truncation is *not* retried: the request body is identical across
+    /// attempts (reasoning is already disabled on the first one), so retrying
+    /// would only burn the time budget on the same outcome — the decision
+    /// window still offers a manual retry.
+    pub fn is_retryable(&self) -> bool {
+        matches!(
+            self.kind,
+            PolishErrorKind::RateLimit
+                | PolishErrorKind::ServerError
+                | PolishErrorKind::Timeout
+                | PolishErrorKind::Network
+                | PolishErrorKind::EmptyContent
+        )
+    }
+
+    /// One-line conclusion, no provider detail. This is what the overlay pill
+    /// shows: it is only ~520px wide and caps at three lines, so a provider's
+    /// own (often English, often long) explanation cannot ride along. Every
+    /// headline below names the thing to fix and fits on a single line.
+    pub fn short_message(&self) -> &'static str {
+        match self.kind {
+            PolishErrorKind::Config => "润色未配置完整",
+            PolishErrorKind::Auth => "API Key 无效或已过期，请在设置中更新",
+            PolishErrorKind::ModelNotFound => "模型不存在或已下线，请在设置中更新模型名称",
+            PolishErrorKind::BadRequest => "请求被模型服务拒绝",
+            PolishErrorKind::RateLimit => "请求过于频繁或余额不足，请稍后再试",
+            PolishErrorKind::ServerError => "模型服务暂时不可用，请稍后再试",
+            PolishErrorKind::Timeout => "模型响应超时",
+            PolishErrorKind::Network => "无法连接模型服务，请检查网络或服务地址",
+            PolishErrorKind::NotFound => "服务地址不正确或不存在（404），请检查服务地址",
+            PolishErrorKind::Truncated => "模型思考占满了输出长度，未能写出正文",
+            PolishErrorKind::EmptyContent => "模型没有返回任何内容",
+            PolishErrorKind::Parse => "无法解析模型返回内容",
+        }
+    }
+
+    /// The headline plus the provider's own wording. Used where there is room to
+    /// read and act on it — the settings history list and the log — never on the
+    /// overlay pill.
+    pub fn user_message(&self) -> String {
+        if self.detail.is_empty() {
+            self.short_message().to_string()
+        } else {
+            format!("{}：{}", self.short_message(), self.detail)
+        }
+    }
+}
+
+impl std::fmt::Display for PolishError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.detail.is_empty() {
+            write!(f, "{:?}", self.kind)
+        } else {
+            write!(f, "{:?}: {}", self.kind, self.detail)
+        }
+    }
+}
+
 /// Outcome of an LLM polishing pass: either a polished transcript, the original
-/// text left untouched (main hotkey / no prompt), or a failure to fall back from.
+/// text left untouched (main hotkey / no prompt), or a classified failure.
 #[derive(Debug, Clone)]
 pub enum PolishOutcome {
     /// Main hotkey or no active prompt: raw text should be pasted unchanged.
     NotPolished,
     /// LLM polishing succeeded with this text.
     Polished(String),
-    /// LLM polishing failed with this error; caller pastes raw text.
-    Failed(String),
+    /// LLM polishing failed; the caller owns the retry/fallback decision.
+    Failed(PolishError),
 }
 
 /// Apply LLM structure_text when a prompt-specific hotkey was used. Resolves the
@@ -201,13 +322,51 @@ fn is_openai_reasoning_model(model: &str) -> bool {
         || m.starts_with("gpt-5")
 }
 
-/// Call LLM API using OpenAI-compatible chat completion format.
-/// All providers are accessed via the /chat/completions endpoint.
-pub async fn call_llm_api(
-    config: &LlmConfig,
-    text: &str,
-    system_prompt: &str,
-) -> Result<String, String> {
+/// Wall-clock budget for a single LLM attempt. Generous enough to ride out a
+/// briefly degraded provider; with reasoning disabled a healthy response takes
+/// a few seconds, so hitting this means the service itself is struggling.
+const LLM_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(45);
+/// Budget across all attempts. Caps how long the user can be left watching
+/// "润色中…" before the failure — and its retry offer — reaches them.
+const LLM_TOTAL_BUDGET: std::time::Duration = std::time::Duration::from_secs(90);
+/// How many attempts a single polishing call may spend, including the first.
+const LLM_MAX_ATTEMPTS: u32 = 3;
+/// Output token budget. With reasoning disabled this is answer text only.
+const LLM_MAX_TOKENS: u32 = 4096;
+
+/// Shared HTTP client. Building a fresh `reqwest::Client` per call forced a new
+/// TLS handshake on every polish, spending part of the request budget on setup
+/// and making timeouts more likely; one pooled client reuses the connection.
+fn http_client() -> &'static reqwest::Client {
+    static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+    CLIENT.get_or_init(|| {
+        reqwest::Client::builder()
+            .timeout(LLM_REQUEST_TIMEOUT)
+            .pool_idle_timeout(std::time::Duration::from_secs(90))
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new())
+    })
+}
+
+/// Map a transport-level reqwest failure onto a kind.
+///
+/// A timeout that fires while the response body is still streaming surfaces as
+/// a decode error, not as a send error, so `is_timeout` has to be consulted on
+/// both — otherwise a provider that stalls mid-response is reported to the user
+/// as "无法解析模型返回内容", which points them at the wrong thing entirely.
+/// A genuine JSON syntax error never reaches here: the body is read as text
+/// first and parsed separately.
+fn classify_transport_error(error: &reqwest::Error) -> PolishErrorKind {
+    if error.is_timeout() {
+        PolishErrorKind::Timeout
+    } else {
+        PolishErrorKind::Network
+    }
+}
+
+/// Resolve the endpoint, credentials and model for the active provider,
+/// falling back to the provider defaults for blank fields.
+fn resolve_endpoint(config: &LlmConfig) -> Result<(String, String, String), PolishError> {
     let provider_id = &config.provider;
     let defaults = get_provider_defaults(provider_id);
     let (provider_url, api_key, model_name) = get_active_provider_config(config);
@@ -217,12 +376,11 @@ pub async fn call_llm_api(
     } else {
         model_name
     };
-
     if model.is_empty() {
-        return Err(format!(
-            "文本润色模型还未配置，缺少 llm.{}.model",
+        return Err(PolishError::config(format!(
+            "缺少 llm.{}.model",
             provider_id
-        ));
+        )));
     }
 
     // The URL is the full chat-completions endpoint, stored verbatim so the
@@ -230,18 +388,30 @@ pub async fn call_llm_api(
     // default endpoint only when the field is empty.
     let url = if provider_url.trim().is_empty() {
         if defaults.default_url.is_empty() {
-            return Err(format!(
-                "文本润色模型还未配置，缺少 llm.{}.url",
-                provider_id
-            ));
+            return Err(PolishError::config(format!("缺少 llm.{}.url", provider_id)));
         }
         defaults.default_url.to_string()
     } else {
         provider_url.trim().trim_end_matches('/').to_string()
     };
 
-    let guarded_system = format!("{}\n\n{}", VOICE_TRANSCRIPT_GUARD_PROMPT, system_prompt);
+    Ok((url, api_key, model))
+}
 
+/// Build the OpenAI-compatible chat-completions payload.
+///
+/// Polishing is a deterministic rewriting task with no need for reasoning, so
+/// providers that expose a thinking switch get it turned off. This is not just
+/// a latency optimization: reasoning tokens are drawn from the same `max_tokens`
+/// budget as the answer, so a thinking model on a long transcript can spend the
+/// entire budget deliberating and return `finish_reason: "length"` with empty
+/// content — which is exactly how polishing used to fail intermittently.
+fn build_request_body(
+    provider_id: &str,
+    model: &str,
+    guarded_system: &str,
+    text: &str,
+) -> serde_json::Value {
     let mut body = json!({
         "model": model,
         "messages": [
@@ -249,34 +419,227 @@ pub async fn call_llm_api(
             { "role": "user", "content": format!("Raw speech-to-text transcript to transform:\n{}", text) }
         ],
         "temperature": 0.3,
-        "max_tokens": 4096,
+        "max_tokens": LLM_MAX_TOKENS,
     });
 
-    // 润色/翻译是确定性任务，不需要推理。对支持 reasoning 控制的 provider
-    // 关闭或最小化推理，避免 reasoning 模型（如 deepseek-v4-flash）默认高强度
-    // 思考导致响应缓慢、撞上 timeout。
-    //   - openrouter: `reasoning.effort` 容错，对 reasoning 模型关闭、普通模型忽略。
-    //   - openai: `reasoning_effort` 仅对 o 系列 / GPT-5 有效，传给 gpt-4o / gpt-4.1
-    //     会被拒（400），故仅在这些模型时附加。
-    //   - anthropic / gemini / deepseek / ollama: 默认模型本就不推理，或其 OpenAI
-    //     兼容端点不支持思考参数，不附加。
-    match provider_id.as_str() {
+    match provider_id {
+        // openrouter: `reasoning.effort` is tolerated — it disables thinking on
+        // reasoning models and is ignored by the rest.
         "openrouter" => {
             body["reasoning"] = json!({ "effort": "none" });
         }
-        // ollama 的 thinking 模型（qwen3 系列）默认开启推理，本地 CPU 上会先
-        // 跑一遍思考再输出，显著拖慢响应。同时附 ollama 原生 think:false（官方
-        // thinking 开关）与 OpenAI 风格 reasoning_effort:none（ollama 兼容映射），
-        // 确保端点按任一方式解析都能关闭 thinking；普通模型忽略这两个参数。
+        // deepseek: the current models (deepseek-flash / deepseek-v4-pro) are
+        // reasoning models that think by default. `reasoning_effort: "none"` is
+        // accepted on the OpenAI-compatible endpoint and drops reasoning tokens
+        // to zero, leaving the whole budget for the answer.
+        "deepseek" => {
+            body["reasoning_effort"] = json!("none");
+        }
+        // ollama's thinking models (qwen3 family) reason by default and are slow
+        // about it on local CPUs. Send both the native `think:false` switch and
+        // the OpenAI-style `reasoning_effort`, so the endpoint disables thinking
+        // whichever one it understands; plain models ignore both.
         "ollama" => {
             body["think"] = json!(false);
             body["reasoning_effort"] = json!("none");
         }
-        "openai" if is_openai_reasoning_model(&model) => {
+        // openai: `reasoning_effort` only applies to the o-series / GPT-5 models
+        // and is rejected (400) by gpt-4o / gpt-4.1, so gate it on the model.
+        "openai" if is_openai_reasoning_model(model) => {
             body["reasoning_effort"] = json!("minimal");
         }
         _ => {}
     }
+
+    body
+}
+
+/// Pull the provider's own explanation out of an error body. Providers return
+/// the actionable part here — DeepSeek, for instance, lists the model names it
+/// accepts when an unknown one is passed — so it is worth surfacing verbatim
+/// rather than collapsing every failure into "润色失败".
+fn extract_api_error_message(body: &str) -> String {
+    let trimmed = body.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed) else {
+        return trimmed.chars().take(MAX_DETAIL_CHARS).collect();
+    };
+
+    // {"error": {"message": "..."}} (OpenAI, DeepSeek, SiliconFlow, OpenRouter)
+    // {"error": "..."} (Ollama and some proxies) / {"message": "..."}
+    let candidate = value
+        .get("error")
+        .and_then(|e| e.get("message"))
+        .or_else(|| value.get("error"))
+        .or_else(|| value.get("message"))
+        .or_else(|| value.pointer("/error/type"));
+
+    match candidate {
+        Some(serde_json::Value::String(msg)) => msg.trim().to_string(),
+        Some(other) => other.to_string(),
+        None => trimmed.chars().take(MAX_DETAIL_CHARS).collect(),
+    }
+}
+
+/// Map an HTTP failure onto a `PolishError`, preferring the provider's own
+/// wording. A 400 that names the model is reported as a model error so the
+/// message points the user at the model field rather than at "bad request".
+/// A 404 only means "model not found" when the body says so; a bare 404 from
+/// a mis-typed URL would otherwise send the user hunting for a model name.
+fn classify_http_error(status: u16, body: &str) -> PolishError {
+    let detail = extract_api_error_message(body);
+    let mentions_model = {
+        let lower = detail.to_ascii_lowercase();
+        lower.contains("model")
+    };
+    let kind = match status {
+        401 | 403 => PolishErrorKind::Auth,
+        404 if mentions_model => PolishErrorKind::ModelNotFound,
+        404 => PolishErrorKind::NotFound,
+        429 => PolishErrorKind::RateLimit,
+        400 | 422 if mentions_model => PolishErrorKind::ModelNotFound,
+        500..=599 => PolishErrorKind::ServerError,
+        _ => PolishErrorKind::BadRequest,
+    };
+    PolishError::new(kind, detail)
+}
+
+/// Read the assistant text out of an OpenAI-compatible completion.
+///
+/// `content` is usually a string, but some compatible endpoints return an array
+/// of content parts, which a plain `as_str()` silently reads as empty.
+fn extract_message_content(message: &serde_json::Value) -> String {
+    match message.get("content") {
+        Some(serde_json::Value::String(s)) => s.trim().to_string(),
+        Some(serde_json::Value::Array(parts)) => parts
+            .iter()
+            .filter_map(|part| match part {
+                serde_json::Value::String(s) => Some(s.as_str()),
+                other => other.get("text").and_then(|t| t.as_str()),
+            })
+            .collect::<Vec<_>>()
+            .join("")
+            .trim()
+            .to_string(),
+        _ => String::new(),
+    }
+}
+
+/// Turn a successful (HTTP 200) completion body into polished text, or into a
+/// classified failure that explains why no text came back.
+fn parse_completion(response: &serde_json::Value) -> Result<String, PolishError> {
+    // Some gateways answer 200 with an error envelope instead of a status code.
+    if response.get("choices").is_none() {
+        let detail = extract_api_error_message(&response.to_string());
+        return Err(PolishError::new(PolishErrorKind::Parse, detail));
+    }
+    let Some(choice) = response.pointer("/choices/0") else {
+        return Err(PolishError::new(
+            PolishErrorKind::EmptyContent,
+            "返回结果中没有候选内容",
+        ));
+    };
+
+    let message = choice.get("message").unwrap_or(&serde_json::Value::Null);
+    let content = extract_message_content(message);
+    if !content.is_empty() {
+        return Ok(content);
+    }
+
+    let finish_reason = choice
+        .get("finish_reason")
+        .and_then(|r| r.as_str())
+        .unwrap_or("");
+    let reasoning_chars = message
+        .get("reasoning_content")
+        .and_then(|r| r.as_str())
+        .map(|r| r.chars().count())
+        .unwrap_or(0);
+
+    // Budget exhausted by reasoning: the model thought until it was cut off.
+    if finish_reason == "length" {
+        return Err(PolishError::new(
+            PolishErrorKind::Truncated,
+            format!(
+                "已用于思考 {} 字，可在设置中改用非推理模型",
+                reasoning_chars
+            ),
+        ));
+    }
+    if reasoning_chars > 0 {
+        return Err(PolishError::new(
+            PolishErrorKind::Truncated,
+            format!("只返回了 {} 字思考过程", reasoning_chars),
+        ));
+    }
+
+    let detail = if finish_reason.is_empty() {
+        String::new()
+    } else {
+        format!("finish_reason={}", finish_reason)
+    };
+    Err(PolishError::new(PolishErrorKind::EmptyContent, detail))
+}
+
+/// Call the LLM, retrying transient failures with a short backoff.
+///
+/// Only `PolishError::is_retryable` kinds are retried: a wrong model name or a
+/// rejected key fails immediately rather than burning the user's time on three
+/// identical rejections.
+pub async fn call_llm_api(
+    config: &LlmConfig,
+    text: &str,
+    system_prompt: &str,
+) -> Result<String, PolishError> {
+    let started = std::time::Instant::now();
+    let mut attempt = 1;
+    loop {
+        match call_llm_once(config, text, system_prompt).await {
+            Ok(content) => return Ok(content),
+            Err(error) => {
+                if attempt >= LLM_MAX_ATTEMPTS || !error.is_retryable() {
+                    return Err(error);
+                }
+                // Another attempt could outlast the budget: fail now so the user
+                // gets the reason and the retry offer instead of a longer wait.
+                if started.elapsed() + LLM_REQUEST_TIMEOUT > LLM_TOTAL_BUDGET {
+                    crate::log_rec!(
+                        warn,
+                        "LLM budget spent after {}s, not retrying: {}",
+                        started.elapsed().as_secs(),
+                        error
+                    );
+                    return Err(error);
+                }
+                let backoff = std::time::Duration::from_millis(400 * u64::from(attempt));
+                crate::log_rec!(
+                    warn,
+                    "LLM attempt {}/{} failed ({}), retrying in {}ms",
+                    attempt,
+                    LLM_MAX_ATTEMPTS,
+                    error,
+                    backoff.as_millis()
+                );
+                tokio::time::sleep(backoff).await;
+                attempt += 1;
+            }
+        }
+    }
+}
+
+/// One LLM attempt against the OpenAI-compatible chat-completions endpoint.
+async fn call_llm_once(
+    config: &LlmConfig,
+    text: &str,
+    system_prompt: &str,
+) -> Result<String, PolishError> {
+    let provider_id = &config.provider;
+    let (url, api_key, model) = resolve_endpoint(config)?;
+
+    let guarded_system = format!("{}\n\n{}", VOICE_TRANSCRIPT_GUARD_PROMPT, system_prompt);
+    let body = build_request_body(provider_id, &model, &guarded_system, text);
 
     // Verbose request logging so the exact payload can be replayed in Postman
     // to distinguish model-capability issues from wiring bugs.
@@ -294,9 +657,7 @@ pub async fn call_llm_api(
         text.chars().take(500).collect::<String>()
     );
 
-    let client = reqwest::Client::new();
-    let mut request = client.post(&url).json(&body);
-
+    let mut request = http_client().post(&url).json(&body);
     if !api_key.is_empty() {
         if provider_id == "anthropic" {
             request = request
@@ -310,38 +671,26 @@ pub async fn call_llm_api(
     }
 
     let response = request
-        .timeout(std::time::Duration::from_secs(30))
         .send()
         .await
-        .map_err(|e| format!("LLM API request failed: {}", e))?;
+        .map_err(|e| PolishError::new(classify_transport_error(&e), e.to_string()))?;
 
-    if !response.status().is_success() {
-        let status = response.status();
+    let status = response.status();
+    if !status.is_success() {
         let body = response.text().await.unwrap_or_default();
-        return Err(format!("LLM API error {}: {}", status, body));
+        let error = classify_http_error(status.as_u16(), &body);
+        crate::log_rec!(warn, "LLM HTTP {} → {}", status.as_u16(), error);
+        return Err(error);
     }
 
-    let response_json: serde_json::Value = response
-        .json()
+    let raw = response
+        .text()
         .await
-        .map_err(|e| format!("Failed to parse LLM response: {}", e))?;
+        .map_err(|e| PolishError::new(classify_transport_error(&e), e.to_string()))?;
+    let response_json: serde_json::Value = serde_json::from_str(&raw)
+        .map_err(|e| PolishError::new(PolishErrorKind::Parse, e.to_string()))?;
 
-    // Extract content from OpenAI-compatible response format
-    let content = response_json
-        .get("choices")
-        .and_then(|c| c.get(0))
-        .and_then(|c| c.get("message"))
-        .and_then(|m| m.get("content"))
-        .and_then(|c| c.as_str())
-        .unwrap_or("")
-        .trim()
-        .to_string();
-
-    if content.is_empty() {
-        return Err("LLM API returned empty content".to_string());
-    }
-
-    Ok(content)
+    parse_completion(&response_json)
 }
 
 // ---------------------------------------------------------------------------
@@ -414,6 +763,263 @@ mod tests {
             ollama: None,
             openai_compatible: None,
         }
+    }
+
+    // ── error classification tests ─────────────────────────────────────────
+
+    #[test]
+    fn extract_error_message_from_openai_envelope() {
+        let body = r#"{"error":{"message":"The supported API model names are deepseek-flash, deepseek-v4-pro, but you passed deepseek-chat-old.","type":"invalid_request_error"}}"#;
+        assert!(extract_api_error_message(body).contains("deepseek-chat-old"));
+    }
+
+    #[test]
+    fn extract_error_message_from_flat_shapes() {
+        assert_eq!(
+            extract_api_error_message(r#"{"error":"model not found"}"#),
+            "model not found"
+        );
+        assert_eq!(
+            extract_api_error_message(r#"{"message":"quota exceeded"}"#),
+            "quota exceeded"
+        );
+    }
+
+    #[test]
+    fn extract_error_message_falls_back_to_raw_body() {
+        assert_eq!(
+            extract_api_error_message("upstream timeout"),
+            "upstream timeout"
+        );
+        assert_eq!(extract_api_error_message("   "), "");
+    }
+
+    #[test]
+    fn classify_maps_status_codes_to_kinds() {
+        assert_eq!(classify_http_error(401, "{}").kind, PolishErrorKind::Auth);
+        assert_eq!(
+            classify_http_error(404, "{}").kind,
+            PolishErrorKind::NotFound
+        );
+        assert_eq!(
+            classify_http_error(429, "{}").kind,
+            PolishErrorKind::RateLimit
+        );
+        assert_eq!(
+            classify_http_error(503, "{}").kind,
+            PolishErrorKind::ServerError
+        );
+        assert_eq!(
+            classify_http_error(400, "{}").kind,
+            PolishErrorKind::BadRequest
+        );
+    }
+
+    #[test]
+    fn classify_404_blaming_the_model_is_model_not_found() {
+        // OpenAI-style 404 whose body names the model: still a model error.
+        let body = r#"{"error":{"message":"The model `gpt-x` does not exist or you do not have access to it."}}"#;
+        assert_eq!(
+            classify_http_error(404, body).kind,
+            PolishErrorKind::ModelNotFound
+        );
+    }
+
+    #[test]
+    fn classify_404_without_model_word_is_a_url_problem() {
+        // A typo'd URL path answers 404 with no model mention: point the user
+        // at the service address, not at the model name.
+        let error = classify_http_error(404, "404 page not found");
+        assert_eq!(error.kind, PolishErrorKind::NotFound);
+        assert!(error.short_message().contains("服务地址"));
+        assert!(!error.is_retryable());
+    }
+
+    #[test]
+    fn network_headline_mentions_the_service_address() {
+        // DNS/TLS failures cover a wrong URL too, not just a dead network.
+        let error = PolishError::new(PolishErrorKind::Network, "dns error");
+        assert!(error.short_message().contains("服务地址"));
+    }
+
+    #[test]
+    fn classify_reads_a_model_complaint_out_of_a_400() {
+        // DeepSeek reports a retired model name as 400, not 404; the message has
+        // to point at the model field for the user to know what to change.
+        let body = r#"{"error":{"message":"The supported API model names are deepseek-flash, but you passed deepseek-chat-old."}}"#;
+        let error = classify_http_error(400, body);
+        assert_eq!(error.kind, PolishErrorKind::ModelNotFound);
+        assert!(error.user_message().contains("deepseek-chat-old"));
+    }
+
+    #[test]
+    fn permanent_errors_are_not_retried() {
+        assert!(!classify_http_error(401, "{}").is_retryable());
+        assert!(!classify_http_error(404, "{}").is_retryable());
+        assert!(!PolishError::config("missing key").is_retryable());
+        assert!(classify_http_error(429, "{}").is_retryable());
+        assert!(classify_http_error(500, "{}").is_retryable());
+    }
+
+    #[test]
+    fn truncated_is_not_retried_but_empty_content_is() {
+        // The request body is identical across attempts, so retrying a
+        // truncation reaps the same truncation; empty content may be transient.
+        assert!(!PolishError::new(PolishErrorKind::Truncated, "").is_retryable());
+        assert!(PolishError::new(PolishErrorKind::EmptyContent, "").is_retryable());
+    }
+
+    #[test]
+    fn detail_is_truncated_to_one_line() {
+        let long = "x".repeat(MAX_DETAIL_CHARS + 200);
+        let error = PolishError::new(PolishErrorKind::BadRequest, long);
+        assert_eq!(error.detail.chars().count(), MAX_DETAIL_CHARS + 1); // + ellipsis
+    }
+
+    #[test]
+    fn short_message_fits_the_overlay_pill() {
+        // The pill is ~520px across and caps at three lines, so the headline has
+        // to stand alone: no provider detail, no English echo, one short line.
+        let kinds = [
+            PolishErrorKind::Config,
+            PolishErrorKind::Auth,
+            PolishErrorKind::ModelNotFound,
+            PolishErrorKind::BadRequest,
+            PolishErrorKind::RateLimit,
+            PolishErrorKind::ServerError,
+            PolishErrorKind::Timeout,
+            PolishErrorKind::Network,
+            PolishErrorKind::NotFound,
+            PolishErrorKind::Truncated,
+            PolishErrorKind::EmptyContent,
+            PolishErrorKind::Parse,
+        ];
+        for kind in kinds {
+            let error = PolishError::new(kind.clone(), "a".repeat(MAX_DETAIL_CHARS));
+            let short = error.short_message();
+            assert!(
+                short.chars().count() <= 24,
+                "{:?} headline too long for the pill: {}",
+                kind,
+                short
+            );
+            assert!(
+                !short.contains('a'),
+                "{:?} headline leaked the detail",
+                kind
+            );
+        }
+    }
+
+    #[test]
+    fn provider_detail_reaches_the_history_list_but_not_the_pill() {
+        let body = r#"{"error":{"message":"The supported API model names are deepseek-flash, but you passed deepseek-chat-old."}}"#;
+        let error = classify_http_error(400, body);
+        assert!(error.user_message().contains("deepseek-chat-old"));
+        assert!(!error.short_message().contains("deepseek-chat-old"));
+    }
+
+    // ── completion parsing tests ───────────────────────────────────────────
+
+    #[test]
+    fn parse_plain_string_content() {
+        let body =
+            json!({"choices":[{"message":{"content":"  整理后的文本  "},"finish_reason":"stop"}]});
+        assert_eq!(parse_completion(&body).unwrap(), "整理后的文本");
+    }
+
+    #[test]
+    fn parse_array_content_parts() {
+        // Some OpenAI-compatible gateways return content as parts; reading it
+        // with a plain as_str() used to surface as a bogus "empty content".
+        let body = json!({"choices":[{"message":{"content":[
+            {"type":"text","text":"整理后的"},
+            {"type":"text","text":"文本"}
+        ]},"finish_reason":"stop"}]});
+        assert_eq!(parse_completion(&body).unwrap(), "整理后的文本");
+    }
+
+    #[test]
+    fn reasoning_model_truncated_before_writing_content() {
+        // The real-world failure: a thinking model spends the whole max_tokens
+        // budget on reasoning and is cut off with no answer text at all.
+        let body = json!({"choices":[{
+            "message":{"content":"","reasoning_content":"嗯，用户想让我整理这段话……"},
+            "finish_reason":"length"
+        }]});
+        let error = parse_completion(&body).unwrap_err();
+        assert_eq!(error.kind, PolishErrorKind::Truncated);
+        // Not retried automatically: the retry sends a byte-identical request
+        // (reasoning was already disabled), so it would truncate the same way.
+        assert!(!error.is_retryable());
+        assert!(error.user_message().contains("思考"));
+    }
+
+    #[test]
+    fn reasoning_only_response_is_reported_as_truncated() {
+        let body = json!({"choices":[{
+            "message":{"content":"","reasoning_content":"思考内容"},
+            "finish_reason":"stop"
+        }]});
+        assert_eq!(
+            parse_completion(&body).unwrap_err().kind,
+            PolishErrorKind::Truncated
+        );
+    }
+
+    #[test]
+    fn empty_content_without_reasoning_keeps_finish_reason() {
+        let body = json!({"choices":[{"message":{"content":""},"finish_reason":"content_filter"}]});
+        let error = parse_completion(&body).unwrap_err();
+        assert_eq!(error.kind, PolishErrorKind::EmptyContent);
+        assert!(error.detail.contains("content_filter"));
+    }
+
+    #[test]
+    fn error_envelope_returned_with_http_200() {
+        let body = json!({"error":{"message":"bad gateway"}});
+        let error = parse_completion(&body).unwrap_err();
+        assert_eq!(error.kind, PolishErrorKind::Parse);
+        assert_eq!(error.detail, "bad gateway");
+    }
+
+    #[test]
+    fn missing_choices_entry_is_empty_content() {
+        let body = json!({"choices":[]});
+        assert_eq!(
+            parse_completion(&body).unwrap_err().kind,
+            PolishErrorKind::EmptyContent
+        );
+    }
+
+    // ── request body tests ─────────────────────────────────────────────────
+
+    #[test]
+    fn deepseek_request_disables_reasoning() {
+        // deepseek-flash reasons by default and draws those tokens from the same
+        // max_tokens budget as the answer, which is what starved the output.
+        let body = build_request_body("deepseek", "deepseek-flash", "sys", "hi");
+        assert_eq!(body["reasoning_effort"], json!("none"));
+        assert_eq!(body["max_tokens"], json!(LLM_MAX_TOKENS));
+    }
+
+    #[test]
+    fn openai_reasoning_param_is_gated_on_the_model() {
+        // gpt-4.1 rejects reasoning_effort with a 400; o-series accepts it.
+        assert!(build_request_body("openai", "gpt-4.1-mini", "sys", "hi")
+            .get("reasoning_effort")
+            .is_none());
+        assert_eq!(
+            build_request_body("openai", "o3-mini", "sys", "hi")["reasoning_effort"],
+            json!("minimal")
+        );
+    }
+
+    #[test]
+    fn ollama_request_sends_both_thinking_switches() {
+        let body = build_request_body("ollama", "qwen3", "sys", "hi");
+        assert_eq!(body["think"], json!(false));
+        assert_eq!(body["reasoning_effort"], json!("none"));
     }
 
     // ── validate_llm_config tests ──────────────────────────────────────────

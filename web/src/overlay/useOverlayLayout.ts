@@ -6,6 +6,9 @@ export interface OverlayLayoutInput {
   finalText: string;
   partialText: string;
   visibleHintText: string;
+  /** Actions line under the hint (decision keys); measured alongside the hint
+   * so the pill fits the wider of the two rows. */
+  actionsText?: string;
   appState: AppState;
   retryVisible: boolean;
   /** Current hint level ("info" | "warn" | "error") — drives the left-slot width
@@ -72,6 +75,12 @@ export function useOverlayLayout(input: OverlayLayoutInput): UseOverlayLayout {
       if (hasHint) {
         measure.textContent = hintText;
         hintWidth = Math.ceil(measure.getBoundingClientRect().width);
+        // The actions row shares the width budget with the hint.
+        if (input.actionsText) {
+          measure.textContent = input.actionsText;
+          const actionsWidth = Math.ceil(measure.getBoundingClientRect().width);
+          hintWidth = Math.max(hintWidth, actionsWidth);
+        }
       }
 
       const retryWidth = input.retryVisible ? m.retry_size + m.retry_gap_left : 0;
@@ -126,6 +135,7 @@ export function useOverlayLayout(input: OverlayLayoutInput): UseOverlayLayout {
     input.finalText,
     input.partialText,
     input.visibleHintText,
+    input.actionsText,
     input.appState,
     input.retryVisible,
     input.hintLevel,

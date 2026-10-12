@@ -183,12 +183,38 @@ export async function deleteHistory(ts: string): Promise<void> {
   return invoke("delete_history", { ts });
 }
 
-export async function playSoundFile(filePath: string): Promise<void> {
-  return invoke("play_sound_file", { filePath });
+/** Start previewing a recording. Replaces any preview already playing. */
+export async function playRecordingPreview(filePath: string): Promise<void> {
+  return invoke("play_recording_preview", { filePath });
+}
+
+/** Stop the recording preview currently playing, if any. */
+export async function stopRecordingPreview(): Promise<void> {
+  return invoke("stop_recording_preview");
+}
+
+/**
+ * Notify when a preview stops — whether it finished on its own or was stopped —
+ * so the play button can return from its pause state.
+ */
+export function onPreviewEnded(listener: () => void): () => void {
+  let active = true;
+  const p = listen<void>("preview:ended", () => {
+    if (active) listener();
+  });
+  return () => {
+    active = false;
+    p.then((fn) => fn());
+  };
 }
 
 export async function retryHistoryTranscription(ts: string): Promise<unknown> {
   return invoke("retry_history_transcription", { ts });
+}
+
+/** Polish a history entry with `promptId`, or with its own template when omitted. */
+export async function repolishHistoryEntry(ts: string, promptId?: string): Promise<unknown> {
+  return invoke("repolish_history_entry", { ts, promptId });
 }
 
 export async function regenerateHistoryTranscription(ts: string): Promise<unknown> {

@@ -74,3 +74,40 @@ body,
 .pulse-text {
   animation: vp-pulse 1.8s ease-in-out infinite;
 }
+
+/* Decision-window countdown: a red border tracing the pill that empties over
+   the 5s window (aligned with the backend POLISH_DECISION_WINDOW), replacing
+   the retry-button ring. A conic gradient masked to a 2px ring sweeps the
+   angle via an animatable custom property. */
+@property --vp-countdown-angle {
+  syntax: "<angle>";
+  initial-value: 0deg;
+  inherits: false;
+}
+
+.pill-countdown {
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  padding: 2px;
+  pointer-events: none;
+  background: conic-gradient(var(--color-overlay-err) var(--vp-countdown-angle), transparent 0);
+  -webkit-mask:
+    linear-gradient(#fff 0 0) content-box,
+    linear-gradient(#fff 0 0);
+  -webkit-mask-composite: xor;
+  mask:
+    linear-gradient(#fff 0 0) content-box,
+    linear-gradient(#fff 0 0);
+  mask-composite: exclude;
+  animation: vp-countdown 5s linear forwards;
+}
+
+@keyframes vp-countdown {
+  from {
+    --vp-countdown-angle: 0deg;
+  }
+  to {
+    --vp-countdown-angle: 360deg;
+  }
+}

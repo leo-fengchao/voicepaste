@@ -73,6 +73,10 @@ pub struct HotkeyConfigInner {
     pub bindings: Vec<HotkeyBinding>,
     /// Whether escape-key cancellation is currently enabled.
     pub escape_enabled: bool,
+    /// Whether the Enter key is currently being watched to confirm "paste the
+    /// raw text". Only enabled during the polish decision window and while a
+    /// polish retry is in flight — Enter is an ordinary typing key otherwise.
+    pub enter_enabled: bool,
     /// Whether the keytap listener thread is currently running.
     /// `false` when the tap could not be created (e.g. missing permissions).
     pub tap_active: bool,
@@ -111,6 +115,7 @@ fn create_config(bindings: Vec<HotkeyBinding>) -> HotkeyConfig {
     Arc::new(RwLock::new(HotkeyConfigInner {
         bindings,
         escape_enabled: false,
+        enter_enabled: false,
         tap_active: false,
         recording: false,
         record_tx: None,
@@ -245,6 +250,37 @@ pub fn setup_keytap_hotkeys(app: &AppHandle) -> Result<(), Box<dyn std::error::E
 pub fn set_escape_enabled(config: &HotkeyConfig, enabled: bool) {
     let mut cfg = config.write().unwrap();
     cfg.escape_enabled = enabled;
+    drop(cfg);
+    sync_suppressed_keys(config);
+}
+
+/// Toggle the Enter confirm key on or off.
+pub fn set_enter_enabled(config: &HotkeyConfig, enabled: bool) {
+    let mut cfg = config.write().unwrap();
+    cfg.enter_enabled = enabled;
+    drop(cfg);
+    sync_suppressed_keys(config);
+}
+
+/// Mirror the ESC/Enter gates into keytap's suppressed-key set so those keys
+/// never reach the foreground app while they are bound as decision keys —
+/// pressing Enter to paste the raw text must not also submit the user's chat
+/// message, and cancelling with ESC must not dismiss their dialogs. The keys
+/// stay visible to our own listener; only the foreground loses them.
+fn sync_suppressed_keys(config: &HotkeyConfig) {
+    let (escape_enabled, enter_enabled) = {
+        let cfg = config.read().unwrap();
+        (cfg.escape_enabled, cfg.enter_enabled)
+    };
+    let mut keys = Vec::new();
+    if escape_enabled {
+        keys.push(keytap::Key::Escape);
+    }
+    if enter_enabled {
+        keys.push(keytap::Key::Enter);
+        keys.push(keytap::Key::NumpadEnter);
+    }
+    keytap::set_suppressed_keys(&keys);
 }
 
 /// Build initial bindings from the current config and prompts.
@@ -354,12 +390,14 @@ mod tests {
         let cfg = config.read().unwrap();
         assert!(cfg.bindings.is_empty());
         assert!(!cfg.escape_enabled);
+        assert!(!cfg.enter_enabled);
         assert!(!cfg.tap_active);
         assert!(!cfg.recording);
     }
 
     #[test]
     fn test_set_escape_enabled() {
+        let _guard = gate_test_lock();
         let config = create_config(vec![]);
         {
             let cfg = config.read().unwrap();
@@ -375,6 +413,56 @@ mod tests {
             let cfg = config.read().unwrap();
             assert!(!cfg.escape_enabled);
         }
+    }
+
+    #[test]
+    fn test_set_enter_enabled() {
+        let _guard = gate_test_lock();
+        let config = create_config(vec![]);
+        {
+            let cfg = config.read().unwrap();
+            assert!(!cfg.enter_enabled);
+        }
+        set_enter_enabled(&config, true);
+        {
+            let cfg = config.read().unwrap();
+            assert!(cfg.enter_enabled);
+        }
+        set_enter_enabled(&config, false);
+        {
+            let cfg = config.read().unwrap();
+            assert!(!cfg.enter_enabled);
+        }
+    }
+
+    /// The suppressed-key set is keytap-global; the gate tests serialize on
+    /// this lock so they don't race each other's mirror updates.
+    fn gate_test_lock() -> std::sync::MutexGuard<'static, ()> {
+        static GATE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        GATE_LOCK.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    #[test]
+    fn decision_gates_drive_the_suppressed_key_set() {
+        let _guard = gate_test_lock();
+
+        let config = create_config(vec![]);
+        set_escape_enabled(&config, false);
+        set_enter_enabled(&config, false);
+        assert!(keytap::suppressed_keys().is_empty());
+
+        set_enter_enabled(&config, true);
+        let keys = keytap::suppressed_keys();
+        assert!(keys.contains(&Key::Enter));
+        assert!(keys.contains(&Key::NumpadEnter));
+        assert!(!keys.contains(&Key::Escape));
+
+        set_escape_enabled(&config, true);
+        assert!(keytap::suppressed_keys().contains(&Key::Escape));
+
+        set_escape_enabled(&config, false);
+        set_enter_enabled(&config, false);
+        assert!(keytap::suppressed_keys().is_empty());
     }
 
     // ── recording flag / record_tx relay tests ────────────────────────────
